@@ -1,0 +1,29 @@
+{
+  "name": "lahacks26",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "MindAnchor MVP memory wiki backend",
+  "main": "index.js",
+  "scripts": {
+    "demo": "tsx src/demo/runDemo.ts",
+    "typecheck": "tsc --noEmit",
+    "build": "tsc",
+    "test": "npm run typecheck"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/arjchatha/LAHACKS26.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/arjchatha/LAHACKS26/issues"
+  },
+  "homepage": "https://github.com/arjchatha/LAHACKS26#readme",
+  "devDependencies": {
+    "@types/node": "^25.6.0",
+    "tsx": "^4.21.0",
+    "typescript": "^6.0.3"
+  }
+}
