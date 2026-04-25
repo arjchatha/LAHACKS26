@@ -1,0 +1,6 @@
+.venv/
+.insightface/
+.mplconfig/
+__pycache__/
+*.pyc
+face_db.json
