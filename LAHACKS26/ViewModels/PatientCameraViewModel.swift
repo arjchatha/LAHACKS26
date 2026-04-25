@@ -81,7 +81,6 @@ final class PatientCameraViewModel: ObservableObject {
             let smoothedResult = FaceDetectionResult.detected(
                 confidence: result.confidence,
                 boundingBox: smoothedRect(toward: result.boundingBox),
-                faceProfileId: result.faceProfileId ?? "face-local-001",
                 sourceImageSize: result.sourceImageSize
             )
 
@@ -106,8 +105,7 @@ final class PatientCameraViewModel: ObservableObject {
         }
     }
 
-    private func smoothedRect(toward nextRect: CGRect?) -> CGRect? {
-        guard let nextRect else { return nil }
+    private func smoothedRect(toward nextRect: CGRect) -> CGRect {
         guard let currentRect = smoothedBoundingBox else {
             smoothedBoundingBox = nextRect
             return nextRect

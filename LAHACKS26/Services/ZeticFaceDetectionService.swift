@@ -22,7 +22,6 @@ final class ZeticFaceDetectionService {
         static let personalKey = "dev_9a803d0633cd4b63a00e6e4d9555b2cc"
         static let modelName = "google/MediaPipe-Face-Detection"
         static let inputShape = [1, 128, 128, 3]
-        static let demoFaceProfileId = "face-maya-001"
     }
 
     private let ciContext = CIContext()
@@ -76,8 +75,7 @@ final class ZeticFaceDetectionService {
             // TODO: Confirm exact MediaPipe/ZETIC output semantics and tune thresholding.
             return FaceDetectionResult.detected(
                 confidence: Double(best.confidence),
-                boundingBox: normalizedBoundingBox(from: best.bbox, imageSize: image.pixelSize),
-                faceProfileId: Constants.demoFaceProfileId
+                boundingBox: normalizedBoundingBox(from: best.bbox, imageSize: image.pixelSize)
             )
         } catch {
             return .none

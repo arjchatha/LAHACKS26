@@ -101,7 +101,7 @@ final class CameraManager: NSObject, ObservableObject {
             throw CameraError.noCamera
         }
 
-        isUsingFrontCamera = camera.position == .front
+        isUsingFrontCamera = false
         session.beginConfiguration()
         if session.canSetSessionPreset(.hd1920x1080) {
             session.sessionPreset = .hd1920x1080
@@ -136,26 +136,22 @@ final class CameraManager: NSObject, ObservableObject {
         previewLayer.videoGravity = .resizeAspectFill
 
         if let connection = videoOutput.connection(with: .video) {
-            configure(connection: connection, mirrored: isUsingFrontCamera)
+            configure(connection: connection, mirrored: false)
         }
 
         if let previewConnection = previewLayer.connection {
-            configure(connection: previewConnection, mirrored: isUsingFrontCamera)
+            configure(connection: previewConnection, mirrored: false)
         }
 
         isConfigured = true
     }
 
     private func preferredCamera() -> AVCaptureDevice? {
-        let cameras = AVCaptureDevice.DiscoverySession(
-            deviceTypes: [.builtInWideAngleCamera, .external],
+        AVCaptureDevice.DiscoverySession(
+            deviceTypes: [.builtInWideAngleCamera],
             mediaType: .video,
-            position: .unspecified
-        ).devices
-
-        return cameras.first(where: { $0.position == .back })
-            ?? cameras.first(where: { $0.position == .front })
-            ?? cameras.first
+            position: .back
+        ).devices.first
     }
 
     private func configure(connection: AVCaptureConnection, mirrored: Bool) {
@@ -207,7 +203,7 @@ private enum CameraError: LocalizedError {
             #if targetEnvironment(simulator)
             "The iPhone Simulator is not exposing a camera. Run on a physical iPhone for live camera preview."
             #else
-            "A camera is not available on this device."
+            "The rear camera is not available on this device."
             #endif
         case .cannotAddInput:
             "The app could not connect to the camera."

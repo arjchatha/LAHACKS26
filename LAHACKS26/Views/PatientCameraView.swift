@@ -19,7 +19,7 @@ struct PatientCameraView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .ignoresSafeArea(.all)
 
-            if viewModel.detectionResult.hasFace, viewModel.detectionResult.boundingBox != nil {
+            if viewModel.detectionResult.hasFace {
                 FaceBoundingBoxOverlay(
                     detection: viewModel.detectionResult
                 )
@@ -92,39 +92,22 @@ private struct FaceBoundingBoxOverlay: View {
     var body: some View {
         GeometryReader { geometry in
             let visibleBounds = CGRect(origin: .zero, size: geometry.size)
-            let rect = (detection.boundingBox ?? .zero)
+            let rect = detection.boundingBox
                 .aspectFillRect(sourceSize: detection.sourceImageSize, destinationSize: geometry.size)
                 .intersection(visibleBounds)
             let insetAmount = max(4, min(rect.width, rect.height) * 0.05)
             let fittedRect = rect.insetBy(dx: insetAmount, dy: insetAmount)
 
             if !fittedRect.isNull && fittedRect.width > 0 && fittedRect.height > 0 {
-                LiquidTrackingBox(
-                    label: displayLabel,
-                    confidence: detection.confidence
-                )
+                LiquidTrackingBox()
                     .frame(width: fittedRect.width, height: fittedRect.height)
                     .position(x: fittedRect.midX, y: fittedRect.midY)
             }
         }
     }
-
-    private var displayLabel: String {
-        guard let faceProfileId = detection.faceProfileId else {
-            return "Face detected"
-        }
-
-        return faceProfileId
-            .replacingOccurrences(of: "-", with: " ")
-            .replacingOccurrences(of: "_", with: " ")
-            .capitalized
-    }
 }
 
 private struct LiquidTrackingBox: View {
-    let label: String
-    let confidence: Double
-
     var body: some View {
         let shape = RoundedRectangle(cornerRadius: 28, style: .continuous)
 
@@ -148,55 +131,10 @@ private struct LiquidTrackingBox: View {
 
             CornerBracketOverlay()
                 .padding(8)
-
-            FaceStatusBadge(label: label, confidence: confidence)
-                .offset(x: 10, y: -26)
         }
         .compositingGroup()
         .shadow(color: .black.opacity(0.22), radius: 18, y: 8)
         .shadow(color: .white.opacity(0.08), radius: 12)
-    }
-}
-
-private struct FaceStatusBadge: View {
-    let label: String
-    let confidence: Double
-
-    var body: some View {
-        let content = HStack(spacing: 8) {
-            Circle()
-                .fill(.white.opacity(0.95))
-                .frame(width: 8, height: 8)
-
-            Text(label)
-                .font(.caption.weight(.semibold))
-                .lineLimit(1)
-
-            Text("\(Int(confidence * 100))%")
-                .font(.caption2.monospacedDigit().weight(.medium))
-                .foregroundStyle(.white.opacity(0.7))
-        }
-        .foregroundStyle(.white)
-        .padding(.horizontal, 12)
-        .padding(.vertical, 9)
-
-        Group {
-            if #available(iOS 26.0, *) {
-                content
-                    .glassEffect(.regular.tint(.white.opacity(0.1)), in: Capsule())
-                    .overlay {
-                        Capsule()
-                            .stroke(.white.opacity(0.2), lineWidth: 1)
-                    }
-            } else {
-                content
-                    .background(.ultraThinMaterial, in: Capsule())
-                    .overlay {
-                        Capsule()
-                            .stroke(.white.opacity(0.18), lineWidth: 1)
-                    }
-            }
-        }
     }
 }
 
@@ -275,8 +213,4 @@ private extension CGRect {
             height: height * displayedSize.height
         )
     }
-}
-
-#Preview {
-    PatientCameraView()
 }

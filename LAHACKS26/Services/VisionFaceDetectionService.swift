@@ -17,7 +17,6 @@ actor AppleVisionFaceDetectionService {
         static let maximumFaceArea: CGFloat = 0.85
         static let minimumAspectRatio: CGFloat = 0.35
         static let maximumAspectRatio: CGFloat = 2.6
-        static let faceProfileId = "face-local-001"
         static let detectionRefreshFrames = 4
         static let minimumTrackingConfidence: VNConfidence = 0.2
     }
@@ -80,7 +79,6 @@ actor AppleVisionFaceDetectionService {
         return FaceDetectionResult.detected(
             confidence: Double(bestFace.confidence),
             boundingBox: normalizedTopLeftRect(from: bestFace.boundingBox),
-            faceProfileId: Constants.faceProfileId,
             sourceImageSize: sourceSize(from: pixelBuffer)
         )
     }
@@ -106,7 +104,6 @@ actor AppleVisionFaceDetectionService {
         return FaceDetectionResult.detected(
             confidence: Double(observation.confidence),
             boundingBox: normalizedTopLeftRect(from: observation.boundingBox),
-            faceProfileId: Constants.faceProfileId,
             sourceImageSize: sourceSize(from: pixelBuffer)
         )
     }

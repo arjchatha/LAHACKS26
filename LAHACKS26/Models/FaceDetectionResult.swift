@@ -8,32 +8,33 @@
 import CoreGraphics
 import Foundation
 
-struct FaceDetectionResult: Equatable {
-    let hasFace: Bool
+struct FaceDetectionResult: Identifiable, Equatable {
+    let id: UUID
     let confidence: Double
-    let boundingBox: CGRect?
-    let faceProfileId: String?
+    let boundingBox: CGRect
     let sourceImageSize: CGSize?
 
+    var hasFace: Bool {
+        confidence > 0 && !boundingBox.isNull && !boundingBox.isEmpty
+    }
+
     nonisolated static let none = FaceDetectionResult(
-        hasFace: false,
+        id: UUID(),
         confidence: 0,
-        boundingBox: nil,
-        faceProfileId: nil,
+        boundingBox: .null,
         sourceImageSize: nil
     )
 
     nonisolated static func detected(
+        id: UUID = UUID(),
         confidence: Double,
-        boundingBox: CGRect?,
-        faceProfileId: String = "face-maya-001",
+        boundingBox: CGRect,
         sourceImageSize: CGSize? = nil
     ) -> FaceDetectionResult {
         FaceDetectionResult(
-            hasFace: true,
+            id: id,
             confidence: confidence,
             boundingBox: boundingBox,
-            faceProfileId: faceProfileId,
             sourceImageSize: sourceImageSize
         )
     }
