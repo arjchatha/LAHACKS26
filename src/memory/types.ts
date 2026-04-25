@@ -16,7 +16,30 @@ export type EventType =
   | "personAsked"
   | "routineCompleted"
   | "patientReported"
-  | "caregiverCorrection";
+  | "caregiverCorrection"
+  | "personEnrollmentStarted"
+  | "personEnrollmentTranscriptAdded"
+  | "personEnrollmentFaceAttached"
+  | "personEnrollmentDraftCreated"
+  | "personEnrollmentApproved"
+  | "personEnrollmentRejected"
+  | "patientSpeechProcessed";
+
+export type PatientSpeechIntent =
+  | "objectLocation"
+  | "confusion"
+  | "personIdentity"
+  | "routineStatus"
+  | "unknown";
+
+export type EnrollmentStatus =
+  | "collectingEvidence"
+  | "draftCreated"
+  | "caregiverReview"
+  | "approved"
+  | "rejected";
+
+export type RecognitionStatus = "unverified" | "approvedForRecognition";
 
 export interface MemoryBase {
   id: string;
@@ -36,6 +59,11 @@ export interface PersonMemory extends MemoryBase {
   relationship: string;
   calmingDescription: string;
   trustedSupport: boolean;
+  recognitionStatus?: RecognitionStatus;
+  faceProfileId?: string;
+  needsCaregiverReview?: boolean;
+  evidenceNotes?: string[];
+  status?: "draft" | "approved" | "rejected";
 }
 
 export interface ObjectMemory extends MemoryBase {
@@ -88,12 +116,38 @@ export interface DailySummary {
   narrative: string;
 }
 
+export interface PatientSpeechResult {
+  transcript: string;
+  intent: PatientSpeechIntent;
+  spokenResponse: string;
+  displayText: string;
+  needsCaregiverReview: boolean;
+  relatedMemoryIds: string[];
+}
+
+export interface PersonEnrollmentSession {
+  id: string;
+  status: EnrollmentStatus;
+  startedAt: string;
+  updatedAt: string;
+  transcriptSnippets: string[];
+  extractedName?: string;
+  extractedRelationship?: string;
+  extractionConfidence?: number;
+  faceProfileId?: string;
+  faceCaptureConfidence?: number;
+  draftPersonId?: string;
+  needsCaregiverReview: boolean;
+  evidenceNotes: string[];
+}
+
 export interface MemorySeedData {
   people: PersonMemory[];
   objects: ObjectMemory[];
   routines: RoutineMemory[];
   places: PlaceMemory[];
   events: EventMemory[];
+  enrollmentSessions: PersonEnrollmentSession[];
 }
 
 export type MemorySnapshot = MemorySeedData;

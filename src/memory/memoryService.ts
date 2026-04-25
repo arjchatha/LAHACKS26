@@ -4,8 +4,12 @@ import type {
   EventMemory,
   ObjectCorrectionFields,
   ObjectMemory,
+  PatientSpeechResult,
+  PersonEnrollmentSession,
   PersonMemory,
+  RecognitionStatus,
   RoutineMemory,
+  TrustLevel,
 } from "./types.js";
 
 export interface PatientHomeRoutine {
@@ -49,27 +53,65 @@ export interface CaregiverDashboardEvent {
   details: string;
 }
 
+export interface CaregiverDashboardObject {
+  id: string;
+  name: string;
+  usualLocation?: string;
+  lastSeenLocation?: string;
+  lastSeenAt?: string;
+  trustLevel: TrustLevel;
+  confidence?: number;
+}
+
+export interface CaregiverDashboardRoutine {
+  id: string;
+  name: string;
+  scheduledTime: string;
+  completedAt?: string;
+  safetyCritical: boolean;
+}
+
+export interface CaregiverDashboardDraftPerson {
+  id: string;
+  name: string;
+  relationship: string;
+  status: "draft" | "approved" | "rejected";
+  recognitionStatus: RecognitionStatus;
+  faceProfileId?: string;
+  needsCaregiverReview: boolean;
+  evidenceNotes: string[];
+  updatedAt: string;
+}
+
+export interface CaregiverDashboardEnrollmentSession {
+  id: string;
+  status: string;
+  startedAt: string;
+  updatedAt: string;
+  transcriptSnippets: string[];
+  extractedName?: string;
+  extractedRelationship?: string;
+  extractionConfidence?: number;
+  faceProfileId?: string;
+  faceCaptureConfidence?: number;
+  draftPersonId?: string;
+  needsCaregiverReview: boolean;
+  evidenceNotes: string[];
+}
+
+export interface CaregiverNeedsReview {
+  draftPeople: CaregiverDashboardDraftPerson[];
+  enrollmentSessions: CaregiverDashboardEnrollmentSession[];
+  events: CaregiverDashboardEvent[];
+}
+
 export interface CaregiverDashboard {
   summary: DailySummary;
+  needsReview: CaregiverNeedsReview;
   reviewItems: CaregiverDashboardEvent[];
   recentEvents: CaregiverDashboardEvent[];
-  objects: Array<{
-    id: string;
-    name: string;
-    usualLocation?: string;
-    lastSeenLocation?: string;
-    lastSeenDisplay?: string;
-    trustLevel: string;
-    confidence?: number;
-  }>;
-  routines: Array<{
-    id: string;
-    name: string;
-    scheduledTime: string;
-    completedAt?: string;
-    completedDisplay?: string;
-    safetyCritical: boolean;
-  }>;
+  objects: CaregiverDashboardObject[];
+  routines: CaregiverDashboardRoutine[];
 }
 
 export interface PatientAnswer {
@@ -119,7 +161,7 @@ export class MemoryService {
     objectName: string,
     location: string,
     confidence: number,
-  ): MutationResult<ObjectMemory> {
+  ): MutationResult<CaregiverDashboardObject> {
     const object = this.store.updateObjectLastSeen(
       objectName,
       location,
@@ -129,7 +171,7 @@ export class MemoryService {
 
     return {
       ok: true,
-      data: object,
+      data: this.toDashboardObject(object),
       message: `${object.name} detected near ${location}.`,
     };
   }
@@ -146,12 +188,12 @@ export class MemoryService {
     };
   }
 
-  public completeRoutine(routineName: string): MutationResult<RoutineMemory> {
+  public completeRoutine(routineName: string): MutationResult<CaregiverDashboardRoutine> {
     const routine = this.store.logRoutineCompleted(routineName);
     return routine
       ? {
           ok: true,
-          data: routine,
+          data: this.toDashboardRoutine(routine),
           message: `${routine.name} marked complete.`,
         }
       : {
@@ -163,49 +205,144 @@ export class MemoryService {
   public correctObject(
     objectName: string,
     fields: ObjectCorrectionFields,
-  ): MutationResult<ObjectMemory> {
+  ): MutationResult<CaregiverDashboardObject> {
     const object = this.store.correctObjectMemory(objectName, fields, "Anita");
     return {
       ok: true,
-      data: object,
+      data: this.toDashboardObject(object),
       message: `${object.name} memory updated by caregiver.`,
     };
+  }
+
+  public startPersonEnrollmentSession(): MutationResult<CaregiverDashboardEnrollmentSession> {
+    const session = this.store.startPersonEnrollmentSession();
+    return {
+      ok: true,
+      data: this.toDashboardEnrollmentSession(session),
+      message: `Started enrollment session ${session.id}.`,
+    };
+  }
+
+  public addEnrollmentTranscript(
+    sessionId: string,
+    transcript: string,
+  ): MutationResult<CaregiverDashboardEnrollmentSession> {
+    const session = this.store.addEnrollmentTranscript(sessionId, transcript);
+    return session
+      ? {
+          ok: true,
+          data: this.toDashboardEnrollmentSession(session),
+          message: `Added transcript to ${session.id}.`,
+        }
+      : {
+          ok: false,
+          message: `No enrollment session named "${sessionId}" was found.`,
+        };
+  }
+
+  public attachEnrollmentFaceProfile(
+    sessionId: string,
+    faceProfileId: string,
+    confidence: number,
+  ): MutationResult<CaregiverDashboardEnrollmentSession> {
+    const session = this.store.attachEnrollmentFaceProfile(sessionId, faceProfileId, confidence);
+    return session
+      ? {
+          ok: true,
+          data: this.toDashboardEnrollmentSession(session),
+          message: `Attached face profile ${faceProfileId} to ${session.id}.`,
+        }
+      : {
+          ok: false,
+          message: `No enrollment session named "${sessionId}" was found.`,
+        };
+  }
+
+  public createDraftPersonFromEnrollment(
+    sessionId: string,
+  ): MutationResult<CaregiverDashboardDraftPerson> {
+    const person = this.store.createDraftPersonFromEnrollment(sessionId);
+    return person
+      ? {
+          ok: true,
+          data: this.toDashboardDraftPerson(person),
+          message: `Created draft person memory for ${person.name}.`,
+        }
+      : {
+          ok: false,
+          message: `No enrollment session named "${sessionId}" was found.`,
+        };
+  }
+
+  public approvePersonEnrollment(
+    personId: string,
+    caregiverName: string,
+  ): MutationResult<CaregiverDashboardDraftPerson> {
+    const person = this.store.approvePersonEnrollment(personId, caregiverName);
+    return person
+      ? {
+          ok: true,
+          data: this.toDashboardDraftPerson(person),
+          message: `${person.name} approved for recognition.`,
+        }
+      : {
+          ok: false,
+          message: `No person memory named "${personId}" was found.`,
+        };
+  }
+
+  public rejectPersonEnrollment(
+    personId: string,
+    caregiverName: string,
+  ): MutationResult<CaregiverDashboardDraftPerson> {
+    const person = this.store.rejectPersonEnrollment(personId, caregiverName);
+    return person
+      ? {
+          ok: true,
+          data: this.toDashboardDraftPerson(person),
+          message: `${person.name} rejected for recognition.`,
+        }
+      : {
+          ok: false,
+          message: `No person memory named "${personId}" was found.`,
+        };
+  }
+
+  public recognizeApprovedPerson(faceProfileId: string): PatientAnswer {
+    return {
+      answer: this.store.recognizeApprovedPerson(faceProfileId),
+    };
+  }
+
+  public processPatientSpeech(transcript: string): PatientSpeechResult {
+    return this.store.processPatientSpeech(transcript);
   }
 
   public getCaregiverDashboard(): CaregiverDashboard {
     const snapshot = this.store.getSnapshot();
     const recentEvents = snapshot.events.slice(-10).reverse().map((event) => this.toDashboardEvent(event));
+    const reviewEvents = snapshot.events
+      .filter((event) => event.needsCaregiverReview)
+      .reverse()
+      .map((event) => this.toDashboardEvent(event));
+    const draftPeople = snapshot.people
+      .filter((person) => person.needsCaregiverReview || person.status === "draft")
+      .map((person) => this.toDashboardDraftPerson(person));
+    const enrollmentSessions = snapshot.enrollmentSessions
+      .filter((session) => session.needsCaregiverReview || session.status === "caregiverReview")
+      .map((session) => this.toDashboardEnrollmentSession(session));
 
     return {
       summary: this.store.generateDailySummary(),
-      reviewItems: snapshot.events
-        .filter((event) => event.needsCaregiverReview)
-        .reverse()
-        .map((event) => this.toDashboardEvent(event)),
+      needsReview: {
+        draftPeople,
+        enrollmentSessions,
+        events: reviewEvents,
+      },
+      reviewItems: reviewEvents,
       recentEvents,
-      objects: snapshot.objects.map((object) => {
-        const lastSeenDisplay = this.formatTimestamp(object.lastSeenAt);
-        return {
-          id: object.id,
-          name: object.name,
-          ...(object.usualLocation ? { usualLocation: object.usualLocation } : {}),
-          ...(object.lastSeenLocation ? { lastSeenLocation: object.lastSeenLocation } : {}),
-          ...(lastSeenDisplay ? { lastSeenDisplay } : {}),
-          trustLevel: object.trustLevel,
-          ...(object.confidence === undefined ? {} : { confidence: object.confidence }),
-        };
-      }),
-      routines: snapshot.routines.map((routine) => {
-        const completedDisplay = this.formatTimestamp(routine.completedAt);
-        return {
-          id: routine.id,
-          name: routine.name,
-          scheduledTime: routine.scheduledTime,
-          ...(routine.completedAt ? { completedAt: routine.completedAt } : {}),
-          ...(completedDisplay ? { completedDisplay } : {}),
-          safetyCritical: Boolean(routine.safetyCritical),
-        };
-      }),
+      objects: snapshot.objects.map((object) => this.toDashboardObject(object)),
+      routines: snapshot.routines.map((routine) => this.toDashboardRoutine(routine)),
     };
   }
 
@@ -253,6 +390,70 @@ export class MemoryService {
     };
   }
 
+  private toDashboardObject(object: ObjectMemory): CaregiverDashboardObject {
+    const lastSeenAt = this.formatTimestamp(object.lastSeenAt);
+    return {
+      id: object.id,
+      name: object.name,
+      ...(object.usualLocation ? { usualLocation: object.usualLocation } : {}),
+      ...(object.lastSeenLocation ? { lastSeenLocation: object.lastSeenLocation } : {}),
+      ...(lastSeenAt ? { lastSeenAt } : {}),
+      trustLevel: object.trustLevel,
+      ...(object.confidence === undefined ? {} : { confidence: object.confidence }),
+    };
+  }
+
+  private toDashboardRoutine(routine: RoutineMemory): CaregiverDashboardRoutine {
+    const completedAt = this.formatTimestamp(routine.completedAt);
+    return {
+      id: routine.id,
+      name: routine.name,
+      scheduledTime: routine.scheduledTime,
+      ...(completedAt ? { completedAt } : {}),
+      safetyCritical: Boolean(routine.safetyCritical),
+    };
+  }
+
+  private toDashboardDraftPerson(person: PersonMemory): CaregiverDashboardDraftPerson {
+    return {
+      id: person.id,
+      name: person.name,
+      relationship: person.relationship,
+      status: person.status ?? (person.caregiverApproved ? "approved" : "draft"),
+      recognitionStatus: person.recognitionStatus ?? "unverified",
+      ...(person.faceProfileId ? { faceProfileId: person.faceProfileId } : {}),
+      needsCaregiverReview: Boolean(person.needsCaregiverReview),
+      evidenceNotes: person.evidenceNotes ?? [],
+      updatedAt: this.formatTimestamp(person.updatedAt) ?? "Unknown",
+    };
+  }
+
+  private toDashboardEnrollmentSession(
+    session: PersonEnrollmentSession,
+  ): CaregiverDashboardEnrollmentSession {
+    return {
+      id: session.id,
+      status: session.status,
+      startedAt: this.formatTimestamp(session.startedAt) ?? "Unknown",
+      updatedAt: this.formatTimestamp(session.updatedAt) ?? "Unknown",
+      transcriptSnippets: session.transcriptSnippets,
+      ...(session.extractedName ? { extractedName: session.extractedName } : {}),
+      ...(session.extractedRelationship
+        ? { extractedRelationship: session.extractedRelationship }
+        : {}),
+      ...(session.extractionConfidence === undefined
+        ? {}
+        : { extractionConfidence: session.extractionConfidence }),
+      ...(session.faceProfileId ? { faceProfileId: session.faceProfileId } : {}),
+      ...(session.faceCaptureConfidence === undefined
+        ? {}
+        : { faceCaptureConfidence: session.faceCaptureConfidence }),
+      ...(session.draftPersonId ? { draftPersonId: session.draftPersonId } : {}),
+      needsCaregiverReview: session.needsCaregiverReview,
+      evidenceNotes: session.evidenceNotes,
+    };
+  }
+
   private formatTimestamp(value: string | undefined): string | undefined {
     if (!value) {
       return undefined;
@@ -282,7 +483,8 @@ export const detectObject = (
   objectName: string,
   location: string,
   confidence: number,
-): MutationResult<ObjectMemory> => memoryService.detectObject(objectName, location, confidence);
+): MutationResult<CaregiverDashboardObject> =>
+  memoryService.detectObject(objectName, location, confidence);
 
 export const askWhereIsObject = (objectName: string): PatientAnswer =>
   memoryService.askWhereIsObject(objectName);
@@ -290,15 +492,55 @@ export const askWhereIsObject = (objectName: string): PatientAnswer =>
 export const reportConfusion = (transcript: string): PatientAnswer =>
   memoryService.reportConfusion(transcript);
 
-export const completeRoutine = (routineName: string): MutationResult<RoutineMemory> =>
+export const processPatientSpeech = (transcript: string): PatientSpeechResult =>
+  memoryService.processPatientSpeech(transcript);
+
+export const completeRoutine = (routineName: string): MutationResult<CaregiverDashboardRoutine> =>
   memoryService.completeRoutine(routineName);
 
 export const correctObject = (
   objectName: string,
   fields: ObjectCorrectionFields,
-): MutationResult<ObjectMemory> => memoryService.correctObject(objectName, fields);
+): MutationResult<CaregiverDashboardObject> => memoryService.correctObject(objectName, fields);
 
 export const getCaregiverDashboard = (): CaregiverDashboard =>
   memoryService.getCaregiverDashboard();
 
 export const getMarkdownWiki = (): string => memoryService.getMarkdownWiki();
+
+export const startPersonEnrollmentSession =
+  (): MutationResult<CaregiverDashboardEnrollmentSession> =>
+    memoryService.startPersonEnrollmentSession();
+
+export const addEnrollmentTranscript = (
+  sessionId: string,
+  transcript: string,
+): MutationResult<CaregiverDashboardEnrollmentSession> =>
+  memoryService.addEnrollmentTranscript(sessionId, transcript);
+
+export const attachEnrollmentFaceProfile = (
+  sessionId: string,
+  faceProfileId: string,
+  confidence: number,
+): MutationResult<CaregiverDashboardEnrollmentSession> =>
+  memoryService.attachEnrollmentFaceProfile(sessionId, faceProfileId, confidence);
+
+export const createDraftPersonFromEnrollment = (
+  sessionId: string,
+): MutationResult<CaregiverDashboardDraftPerson> =>
+  memoryService.createDraftPersonFromEnrollment(sessionId);
+
+export const approvePersonEnrollment = (
+  personId: string,
+  caregiverName: string,
+): MutationResult<CaregiverDashboardDraftPerson> =>
+  memoryService.approvePersonEnrollment(personId, caregiverName);
+
+export const rejectPersonEnrollment = (
+  personId: string,
+  caregiverName: string,
+): MutationResult<CaregiverDashboardDraftPerson> =>
+  memoryService.rejectPersonEnrollment(personId, caregiverName);
+
+export const recognizeApprovedPerson = (faceProfileId: string): PatientAnswer =>
+  memoryService.recognizeApprovedPerson(faceProfileId);

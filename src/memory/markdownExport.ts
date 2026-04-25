@@ -1,4 +1,5 @@
 import type {
+  DailySummary,
   EventMemory,
   ObjectMemory,
   PersonMemory,
@@ -12,6 +13,7 @@ export interface MarkdownWikiInput {
   routines: RoutineMemory[];
   places: PlaceMemory[];
   events: EventMemory[];
+  dailySummary?: DailySummary;
 }
 
 const formatList = (items: string[]): string =>
@@ -41,6 +43,11 @@ const formatTimestamp = (value: string | undefined): string => {
 const formatField = (label: string, value: string | number | boolean | undefined): string =>
   `- ${label}: ${value === undefined || value === "" ? "Unknown" : String(value)}`;
 
+const toDisplayLabel = (value: string): string =>
+  value
+    .replace(/([A-Z])/g, " $1")
+    .replace(/^./, (char) => char.toUpperCase());
+
 const section = (title: string, body: string): string => `## ${title}\n\n${body}`;
 
 const personPage = (person: PersonMemory): string =>
@@ -48,15 +55,22 @@ const personPage = (person: PersonMemory): string =>
     `### ${person.name}`,
     formatField("ID", person.id),
     formatField("Relationship", person.relationship),
+    formatField("Status", person.status ? toDisplayLabel(person.status) : undefined),
     formatField("Trust", person.trustLevel),
     formatField("Caregiver approved", person.caregiverApproved),
     formatField("Trusted support", person.trustedSupport),
+    formatField("Recognition status", person.recognitionStatus),
+    formatField("Face profile", person.faceProfileId),
+    formatField("Needs caregiver review", person.needsCaregiverReview),
     formatField("Updated", formatTimestamp(person.updatedAt)),
     "",
     person.calmingDescription,
     "",
     "Notes:",
     formatList(person.notes),
+    "",
+    "Evidence notes:",
+    formatList(person.evidenceNotes ?? []),
   ].join("\n");
 
 const objectPage = (object: ObjectMemory): string =>
@@ -124,6 +138,11 @@ const eventPage = (event: EventMemory): string =>
     formatList(event.notes),
   ].join("\n");
 
+const dailySummaryPage = (summary: DailySummary | undefined): string =>
+  summary
+    ? [`### ${summary.displayDate}`, ...summary.bullets.map((bullet) => `- ${bullet}`)].join("\n")
+    : "_No daily summary generated._";
+
 export const exportMarkdownWiki = (input: MarkdownWikiInput): string => {
   const people = input.people.map(personPage).join("\n\n");
   const objects = input.objects.map(objectPage).join("\n\n");
@@ -139,5 +158,6 @@ export const exportMarkdownWiki = (input: MarkdownWikiInput): string => {
     section("Routines", routines || "_No routine memories._"),
     section("Places", places || "_No place memories._"),
     section("Events", events || "_No events logged._"),
+    section("Daily Summary", dailySummaryPage(input.dailySummary)),
   ].join("\n\n");
 };

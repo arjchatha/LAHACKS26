@@ -137,4 +137,5 @@ export const seedData: MemorySeedData = {
   routines: seedRoutines,
   places: seedPlaces,
   events: [],
+  enrollmentSessions: [],
 };

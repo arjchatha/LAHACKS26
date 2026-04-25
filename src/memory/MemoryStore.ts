@@ -9,7 +9,10 @@ import type {
   MemorySnapshot,
   ObjectCorrectionFields,
   ObjectMemory,
+  PersonEnrollmentSession,
   PersonMemory,
+  PatientSpeechIntent,
+  PatientSpeechResult,
   PlaceMemory,
   RoutineMemory,
   TrustLevel,
@@ -33,6 +36,7 @@ export class MemoryStore {
   private readonly routines = new Map<string, RoutineMemory>();
   private readonly places = new Map<string, PlaceMemory>();
   private readonly events: EventMemory[] = [];
+  private readonly enrollmentSessions = new Map<string, PersonEnrollmentSession>();
 
   public constructor(data: MemorySeedData = seedData) {
     data.people.forEach((person) => this.people.set(this.key(person.name), this.clone(person)));
@@ -40,6 +44,9 @@ export class MemoryStore {
     data.routines.forEach((routine) => this.routines.set(this.key(routine.name), this.clone(routine)));
     data.places.forEach((place) => this.places.set(this.key(place.name), this.clone(place)));
     data.events.forEach((event) => this.events.push(this.clone(event)));
+    data.enrollmentSessions.forEach((session) =>
+      this.enrollmentSessions.set(session.id, this.clone(session)),
+    );
   }
 
   public updateObjectLastSeen(
@@ -263,6 +270,363 @@ export class MemoryStore {
     return this.clone(corrected);
   }
 
+  public startPersonEnrollmentSession(): PersonEnrollmentSession {
+    const now = this.now();
+    const session: PersonEnrollmentSession = {
+      id: `enrollment-${String(this.enrollmentSessions.size + 1).padStart(4, "0")}`,
+      status: "collectingEvidence",
+      startedAt: now,
+      updatedAt: now,
+      transcriptSnippets: [],
+      needsCaregiverReview: false,
+      evidenceNotes: ["Enrollment started from an on-device conversation flow."],
+    };
+
+    this.enrollmentSessions.set(session.id, session);
+    this.logEvent({
+      eventType: "personEnrollmentStarted",
+      title: "Person enrollment started",
+      details: `Started person enrollment session ${session.id}.`,
+      trustLevel: "aiObserved",
+      source: "demo",
+      relatedMemoryIds: [session.id],
+    });
+
+    return this.clone(session);
+  }
+
+  public addEnrollmentTranscript(
+    sessionId: string,
+    transcript: string,
+  ): PersonEnrollmentSession | undefined {
+    const session = this.enrollmentSessions.get(sessionId);
+    if (!session) {
+      return undefined;
+    }
+
+    const now = this.now();
+    const extracted = this.extractIdentity(transcript);
+    const updated: PersonEnrollmentSession = {
+      ...session,
+      updatedAt: now,
+      transcriptSnippets: [...session.transcriptSnippets, transcript],
+      evidenceNotes: [
+        ...session.evidenceNotes,
+        `Transcript evidence: "${transcript}"`,
+        ...(extracted.name ? [`Extracted possible name: ${extracted.name}.`] : []),
+        ...(extracted.relationship
+          ? [`Extracted possible relationship: ${extracted.relationship}.`]
+          : []),
+      ],
+      ...(extracted.name ? { extractedName: extracted.name } : {}),
+      ...(extracted.relationship ? { extractedRelationship: extracted.relationship } : {}),
+      ...(extracted.confidence === undefined
+        ? {}
+        : { extractionConfidence: extracted.confidence }),
+    };
+
+    this.enrollmentSessions.set(sessionId, updated);
+    this.logEvent({
+      eventType: "personEnrollmentTranscriptAdded",
+      title: "Enrollment transcript added",
+      details: `Added transcript to ${sessionId}.`,
+      trustLevel: "aiObserved",
+      source: "speech",
+      ...(extracted.confidence === undefined ? {} : { confidence: extracted.confidence }),
+      relatedMemoryIds: [sessionId],
+      notes: [`Transcript: "${transcript}"`],
+    });
+
+    return this.clone(updated);
+  }
+
+  public attachEnrollmentFaceProfile(
+    sessionId: string,
+    faceProfileId: string,
+    confidence: number,
+  ): PersonEnrollmentSession | undefined {
+    const session = this.enrollmentSessions.get(sessionId);
+    if (!session) {
+      return undefined;
+    }
+
+    const updated: PersonEnrollmentSession = {
+      ...session,
+      updatedAt: this.now(),
+      faceProfileId,
+      faceCaptureConfidence: confidence,
+      evidenceNotes: [
+        ...session.evidenceNotes,
+        `Local face profile evidence: ${faceProfileId} (${Math.round(confidence * 100)}% confidence).`,
+      ],
+    };
+
+    this.enrollmentSessions.set(sessionId, updated);
+    this.logEvent({
+      eventType: "personEnrollmentFaceAttached",
+      title: "Enrollment face profile attached",
+      details: `Attached local face profile ${faceProfileId} to ${sessionId}.`,
+      trustLevel: "aiObserved",
+      source: "demo",
+      confidence,
+      relatedMemoryIds: [sessionId],
+    });
+
+    return this.clone(updated);
+  }
+
+  public createDraftPersonFromEnrollment(sessionId: string): PersonMemory | undefined {
+    const session = this.enrollmentSessions.get(sessionId);
+    if (!session) {
+      return undefined;
+    }
+
+    const now = this.now();
+    const name = session.extractedName ?? "Unknown Person";
+    const relationship = session.extractedRelationship ?? "unverified contact";
+    const personId = this.uniquePersonId(name);
+    const draft: PersonMemory = {
+      id: personId,
+      type: "person",
+      name,
+      relationship,
+      calmingDescription: `${name} may be your ${relationship}. Anita needs to review this before MindAnchor identifies them.`,
+      trustedSupport: false,
+      createdAt: now,
+      updatedAt: now,
+      trustLevel: "aiObserved",
+      source: "speech",
+      caregiverApproved: false,
+      notes: ["Draft person memory created from local enrollment evidence."],
+      recognitionStatus: "unverified",
+      needsCaregiverReview: true,
+      evidenceNotes: [
+        ...session.evidenceNotes,
+        `Draft created from enrollment session ${session.id}.`,
+      ],
+      status: "draft",
+      ...(session.extractionConfidence === undefined
+        ? {}
+        : { confidence: session.extractionConfidence }),
+      ...(session.faceProfileId ? { faceProfileId: session.faceProfileId } : {}),
+    };
+
+    this.people.set(this.key(draft.name), draft);
+    const updatedSession: PersonEnrollmentSession = {
+      ...session,
+      status: "caregiverReview",
+      updatedAt: now,
+      draftPersonId: draft.id,
+      needsCaregiverReview: true,
+      evidenceNotes: [
+        ...session.evidenceNotes,
+        `Draft person memory ${draft.id} created for caregiver review.`,
+      ],
+    };
+    this.enrollmentSessions.set(session.id, updatedSession);
+
+    this.logEvent({
+      eventType: "personEnrollmentDraftCreated",
+      title: `${draft.name} enrollment draft created`,
+      details: `Created draft person memory for ${draft.name}. Caregiver approval is required before recognition.`,
+      trustLevel: "aiObserved",
+      source: "speech",
+      ...(session.extractionConfidence === undefined
+        ? {}
+        : { confidence: session.extractionConfidence }),
+      needsCaregiverReview: true,
+      relatedMemoryIds: [draft.id, session.id],
+      notes: draft.evidenceNotes ?? [],
+    });
+
+    return this.clone(draft);
+  }
+
+  public approvePersonEnrollment(
+    personId: string,
+    caregiverName: string,
+  ): PersonMemory | undefined {
+    const person = this.findPersonById(personId);
+    if (!person) {
+      return undefined;
+    }
+
+    const now = this.now();
+    const approved: PersonMemory = {
+      ...person,
+      updatedAt: now,
+      trustLevel: "caregiverApproved",
+      source: "caregiver",
+      caregiverApproved: true,
+      trustedSupport: true,
+      recognitionStatus: "approvedForRecognition",
+      needsCaregiverReview: false,
+      status: "approved",
+      calmingDescription: `This is ${person.name}, your ${person.relationship}.`,
+      evidenceNotes: [
+        ...(person.evidenceNotes ?? []),
+        `Approved by ${caregiverName} at ${this.formatTimeForHumans(now)}.`,
+      ],
+      notes: [
+        ...person.notes,
+        `Enrollment approved by ${caregiverName} at ${this.formatTimeForHumans(now)}.`,
+      ],
+    };
+
+    this.people.set(this.key(approved.name), approved);
+    this.updateEnrollmentForDraft(personId, "approved", false, now);
+    this.clearReviewEventsForMemory(personId, now);
+    this.logEvent({
+      eventType: "personEnrollmentApproved",
+      title: `${approved.name} enrollment approved`,
+      details: `${caregiverName} approved ${approved.name} for recognition.`,
+      trustLevel: "caregiverApproved",
+      source: "caregiver",
+      relatedMemoryIds: [approved.id],
+    });
+
+    return this.clone(approved);
+  }
+
+  public rejectPersonEnrollment(
+    personId: string,
+    caregiverName: string,
+  ): PersonMemory | undefined {
+    const person = this.findPersonById(personId);
+    if (!person) {
+      return undefined;
+    }
+
+    const now = this.now();
+    const rejected: PersonMemory = {
+      ...person,
+      updatedAt: now,
+      trustLevel: "caregiverApproved",
+      source: "caregiver",
+      caregiverApproved: false,
+      trustedSupport: false,
+      recognitionStatus: "unverified",
+      needsCaregiverReview: false,
+      status: "rejected",
+      evidenceNotes: [
+        ...(person.evidenceNotes ?? []),
+        `Rejected by ${caregiverName} at ${this.formatTimeForHumans(now)}.`,
+      ],
+      notes: [
+        ...person.notes,
+        `Enrollment rejected by ${caregiverName} at ${this.formatTimeForHumans(now)}.`,
+      ],
+    };
+
+    this.people.set(this.key(rejected.name), rejected);
+    this.updateEnrollmentForDraft(personId, "rejected", false, now);
+    this.clearReviewEventsForMemory(personId, now);
+    this.logEvent({
+      eventType: "personEnrollmentRejected",
+      title: `${rejected.name} enrollment rejected`,
+      details: `${caregiverName} rejected ${rejected.name} for recognition.`,
+      trustLevel: "caregiverApproved",
+      source: "caregiver",
+      relatedMemoryIds: [rejected.id],
+    });
+
+    return this.clone(rejected);
+  }
+
+  public recognizeApprovedPerson(faceProfileId: string): string {
+    const person = this.peopleList().find(
+      (candidate) =>
+        candidate.faceProfileId === faceProfileId &&
+        candidate.caregiverApproved &&
+        candidate.recognitionStatus === "approvedForRecognition" &&
+        candidate.status !== "rejected",
+    );
+
+    if (!person) {
+      return "I do not recognize this person yet. Please check with Anita before trusting them.";
+    }
+
+    return `This is ${person.name}, your ${person.relationship}.`;
+  }
+
+  public processPatientSpeech(transcript: string): PatientSpeechResult {
+    const normalized = this.key(transcript);
+    let intent: PatientSpeechIntent = "unknown";
+    let spokenResponse = "I am not sure yet. Please ask Anita to help.";
+    let displayText = "Ask Anita for help.";
+    let needsCaregiverReview = false;
+    let relatedMemoryIds: string[] = [];
+
+    if (this.isObjectLocationQuery(normalized)) {
+      const objectName = this.extractObjectNameFromSpeech(transcript) ?? "object";
+      const object = this.findObject(objectName);
+      intent = "objectLocation";
+      spokenResponse = this.answerWhereIsObject(objectName);
+      displayText = object?.lastSeenLocation
+        ? `${object.name}: ${object.lastSeenLocation}`
+        : object?.usualLocation
+          ? `${object.name}: usually ${object.usualLocation}`
+          : spokenResponse;
+      relatedMemoryIds = object ? [object.id] : [];
+    } else if (this.isConfusionSpeech(normalized)) {
+      const routine = this.findMostRelevantRoutine(transcript);
+      intent = "confusion";
+      spokenResponse = this.answerConfusionPhrase(transcript);
+      displayText = routine
+        ? `You are safe. ${routine.name} at ${routine.scheduledTime}.`
+        : "You are safe. Anita can help.";
+      needsCaregiverReview = true;
+      relatedMemoryIds = routine ? [routine.id] : [];
+    } else if (this.isRoutineStatusQuery(normalized)) {
+      const routine = this.findRoutineForSpeech(transcript);
+      intent = "routineStatus";
+      spokenResponse = this.answerRoutineStatusForPatient(routine);
+      displayText = routine
+        ? `${routine.name}: ${routine.completedAt ? "completed" : "not marked complete"}`
+        : "Routine status unknown.";
+      relatedMemoryIds = routine ? [routine.id] : [];
+    } else if (this.isPersonIdentityQuery(normalized)) {
+      const personName = this.extractPersonNameFromSpeech(transcript);
+      const person = personName ? this.findPerson(personName) : undefined;
+      intent = "personIdentity";
+      if (personName && person?.caregiverApproved && person.trustedSupport) {
+        spokenResponse = this.answerWhoIsPerson(personName);
+        displayText = `${person.name}: ${person.relationship}`;
+        relatedMemoryIds = [person.id];
+      } else {
+        spokenResponse =
+          "I cannot confirm who this person is yet. Please check with Anita before trusting them.";
+        displayText = "Person not caregiver-approved yet.";
+        needsCaregiverReview = true;
+        relatedMemoryIds = person ? [person.id] : [];
+      }
+    } else {
+      needsCaregiverReview = true;
+    }
+
+    const speechEventNeedsReview = intent === "confusion" ? false : needsCaregiverReview;
+
+    this.logEvent({
+      eventType: "patientSpeechProcessed",
+      title: `Patient speech: ${intent}`,
+      details: `Transcript: "${transcript}". Spoken response: ${spokenResponse}`,
+      trustLevel: "patientReported",
+      source: "speech",
+      needsCaregiverReview: speechEventNeedsReview,
+      relatedMemoryIds,
+      notes: [`Display text: ${displayText}`],
+    });
+
+    return {
+      transcript,
+      intent,
+      spokenResponse,
+      displayText,
+      needsCaregiverReview,
+      relatedMemoryIds,
+    };
+  }
+
   public generateDailySummary(): DailySummary {
     const today = this.localDate(this.now());
     const displayDate = this.formatDateForHumans(this.now());
@@ -274,7 +638,11 @@ export class MemoryStore {
       .filter((event) => event.eventType === "objectDetected")
       .map((event) => `${event.details} (${this.formatTimeForHumans(event.occurredAt)})`);
     const patientReports = todaysEvents
-      .filter((event) => event.eventType === "patientReported" || event.eventType === "confusion")
+      .filter(
+        (event) =>
+          event.eventType === "patientReported" ||
+          event.eventType === "patientSpeechProcessed",
+      )
       .map((event) => `${event.details} (${this.formatTimeForHumans(event.occurredAt)})`);
     const caregiverCorrections = todaysEvents
       .filter((event) => event.eventType === "caregiverCorrection")
@@ -294,6 +662,9 @@ export class MemoryStore {
       completedRoutines.length > 0
         ? `Completed routines: ${completedRoutines.join("; ")}.`
         : "No routines have been marked complete today.",
+      patientReports.length > 0
+        ? `Patient speech interactions: ${patientReports.join("; ")}.`
+        : "No patient speech interactions logged today.",
       caregiverCorrections.length > 0
         ? `Caregiver corrections: ${caregiverCorrections.join("; ")}.`
         : "No caregiver corrections logged today.",
@@ -320,11 +691,15 @@ export class MemoryStore {
       routines: this.routinesList(),
       places: this.placesList(),
       events: this.eventsList(),
+      enrollmentSessions: this.enrollmentSessionsList(),
     };
   }
 
   public exportMarkdownWiki(): string {
-    return renderMarkdownWiki(this.getSnapshot());
+    return renderMarkdownWiki({
+      ...this.getSnapshot(),
+      dailySummary: this.generateDailySummary(),
+    });
   }
 
   private logEvent(draft: EventDraft): EventMemory {
@@ -392,6 +767,46 @@ export class MemoryStore {
     return this.peopleList().find((person) => person.id === id);
   }
 
+  private updateEnrollmentForDraft(
+    draftPersonId: string,
+    status: "approved" | "rejected",
+    needsCaregiverReview: boolean,
+    updatedAt: string,
+  ): void {
+    const session = this.enrollmentSessionsList().find(
+      (candidate) => candidate.draftPersonId === draftPersonId,
+    );
+    if (!session) {
+      return;
+    }
+
+    this.enrollmentSessions.set(session.id, {
+      ...session,
+      status,
+      needsCaregiverReview,
+      updatedAt,
+      evidenceNotes: [
+        ...session.evidenceNotes,
+        `Enrollment session marked ${status} at ${this.formatTimeForHumans(updatedAt)}.`,
+      ],
+    });
+  }
+
+  private clearReviewEventsForMemory(memoryId: string, updatedAt: string): void {
+    this.events.forEach((event) => {
+      if (!event.needsCaregiverReview || !event.relatedMemoryIds.includes(memoryId)) {
+        return;
+      }
+
+      event.needsCaregiverReview = false;
+      event.updatedAt = updatedAt;
+      event.notes = [
+        ...event.notes,
+        `Caregiver review resolved at ${this.formatTimeForHumans(updatedAt)}.`,
+      ];
+    });
+  }
+
   private findObject(name: string): ObjectMemory | undefined {
     return this.objects.get(this.key(name));
   }
@@ -422,6 +837,152 @@ export class MemoryStore {
 
   private eventsList(): EventMemory[] {
     return this.events.map((event) => this.clone(event));
+  }
+
+  private enrollmentSessionsList(): PersonEnrollmentSession[] {
+    return [...this.enrollmentSessions.values()].map((session) => this.clone(session));
+  }
+
+  private extractIdentity(transcript: string): {
+    name?: string;
+    relationship?: string;
+    confidence?: number;
+  } {
+    const nameMatch = transcript.match(/\b(?:i'm|i am|my name is)\s+([A-Z][a-zA-Z'-]*)/i);
+    const relationshipMatch = transcript.match(/\b(?:i'm|i am)\s+your\s+([^.!?]+)/i);
+    const name = nameMatch?.[1] ? this.toTitleCase(nameMatch[1]) : undefined;
+    const relationship = relationshipMatch?.[1]
+      ? this.cleanRelationship(relationshipMatch[1])
+      : undefined;
+
+    return {
+      ...(name ? { name } : {}),
+      ...(relationship ? { relationship } : {}),
+      ...(name || relationship
+        ? { confidence: name && relationship ? 0.9 : 0.72 }
+        : {}),
+    };
+  }
+
+  private cleanRelationship(value: string): string {
+    return this.key(value)
+      .replace(/^(a|an|the)\s+/, "")
+      .replace(/\s+$/, "");
+  }
+
+  private uniquePersonId(name: string): string {
+    const baseId = this.idFromName("person", name);
+    const existingIds = new Set(this.peopleList().map((person) => person.id));
+    if (!existingIds.has(baseId)) {
+      return baseId;
+    }
+
+    let suffix = 2;
+    while (existingIds.has(`${baseId}-${suffix}`)) {
+      suffix += 1;
+    }
+    return `${baseId}-${suffix}`;
+  }
+
+  private isObjectLocationQuery(normalizedTranscript: string): boolean {
+    return (
+      normalizedTranscript.startsWith("where are") ||
+      normalizedTranscript.startsWith("where is") ||
+      normalizedTranscript.includes("where did i put") ||
+      normalizedTranscript.includes("where are my") ||
+      normalizedTranscript.includes("where is my")
+    );
+  }
+
+  private extractObjectNameFromSpeech(transcript: string): string | undefined {
+    const match = transcript.match(
+      /\bwhere\s+(?:are|is)\s+(?:my|the)?\s*([a-zA-Z][a-zA-Z\s'-]*?)[?.!]*$/i,
+    );
+    const fallback = transcript.match(
+      /\bwhere\s+did\s+i\s+put\s+(?:my|the)?\s*([a-zA-Z][a-zA-Z\s'-]*?)[?.!]*$/i,
+    );
+    const raw = match?.[1] ?? fallback?.[1];
+    if (!raw) {
+      return undefined;
+    }
+
+    return raw.trim().replace(/[?.!]+$/, "");
+  }
+
+  private isConfusionSpeech(normalizedTranscript: string): boolean {
+    return (
+      normalizedTranscript.includes("forgot where i'm going") ||
+      normalizedTranscript.includes("forgot where i am going") ||
+      normalizedTranscript.includes("i feel lost") ||
+      normalizedTranscript.includes("i am lost") ||
+      normalizedTranscript.includes("i'm lost") ||
+      normalizedTranscript.includes("where am i going")
+    );
+  }
+
+  private isRoutineStatusQuery(normalizedTranscript: string): boolean {
+    return (
+      normalizedTranscript.includes("did i take") ||
+      normalizedTranscript.includes("have i taken") ||
+      normalizedTranscript.includes("did i do") ||
+      normalizedTranscript.includes("is my medication done") ||
+      normalizedTranscript.includes("medicine") ||
+      normalizedTranscript.includes("medication")
+    );
+  }
+
+  private findRoutineForSpeech(transcript: string): RoutineMemory | undefined {
+    const normalized = this.key(transcript);
+    if (
+      normalized.includes("medicine") ||
+      normalized.includes("medication") ||
+      normalized.includes("pill")
+    ) {
+      return this.findRoutine("Morning Medication");
+    }
+
+    return this.routinesList().find((routine) =>
+      normalized.includes(this.key(routine.name)),
+    );
+  }
+
+  private answerRoutineStatusForPatient(routine: RoutineMemory | undefined): string {
+    if (!routine) {
+      return "I do not know that routine yet. Please check with Anita.";
+    }
+
+    const completedToday =
+      routine.completedAt && this.localDate(routine.completedAt) === this.localDate(this.now());
+
+    if (completedToday) {
+      return `Yes. ${routine.name} is marked complete today.`;
+    }
+
+    if (routine.name === "Morning Medication") {
+      return "I do not see your morning medication marked complete today. Please check with Anita before taking anything.";
+    }
+
+    return `I do not see ${routine.name.toLowerCase()} marked complete today. Please check with Anita if you are unsure.`;
+  }
+
+  private isPersonIdentityQuery(normalizedTranscript: string): boolean {
+    return (
+      normalizedTranscript === "who is this" ||
+      normalizedTranscript === "who is this?" ||
+      normalizedTranscript.startsWith("who is ") ||
+      normalizedTranscript.startsWith("who's ") ||
+      normalizedTranscript.includes("who am i talking to")
+    );
+  }
+
+  private extractPersonNameFromSpeech(transcript: string): string | undefined {
+    const match = transcript.match(/\bwho(?:\s+is|'s)\s+([A-Z][a-zA-Z'-]*)[?.!]*$/);
+    const name = match?.[1];
+    if (!name || this.key(name) === "this") {
+      return undefined;
+    }
+
+    return this.toTitleCase(name);
   }
 
   private key(value: string): string {
