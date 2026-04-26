@@ -17,14 +17,11 @@ actor AppleVisionFaceDetectionService {
         static let maximumFaceArea: CGFloat = 0.85
         static let minimumAspectRatio: CGFloat = 0.35
         static let maximumAspectRatio: CGFloat = 2.6
-        static let detectionRefreshFrames = 4
-        static let minimumTrackingConfidence: VNConfidence = 0.2
+        static let maximumTrackedFaces = 6
     }
 
     private let sequenceHandler = VNSequenceRequestHandler()
     private let detectionRequest: VNDetectFaceRectanglesRequest
-    private var trackingRequest: VNTrackObjectRequest?
-    private var framesSinceDetection = 0
 
     init() {
         let request = VNDetectFaceRectanglesRequest()
@@ -37,82 +34,38 @@ actor AppleVisionFaceDetectionService {
         // Apple Vision ships with iOS, so there is no model download for the live detector.
     }
 
-    func detectFace(in pixelBuffer: CVPixelBuffer, isUsingFrontCamera _: Bool) async -> FaceDetectionResult {
-        framesSinceDetection += 1
-
-        if framesSinceDetection < Constants.detectionRefreshFrames, let trackedResult = trackFace(in: pixelBuffer) {
-            return trackedResult
-        }
-
-        if let detectedResult = detectNewFace(in: pixelBuffer) {
-            framesSinceDetection = 0
-            return detectedResult
-        }
-
-        if let trackedResult = trackFace(in: pixelBuffer) {
-            return trackedResult
-        }
-
-        trackingRequest = nil
-        framesSinceDetection = 0
-        return .none
-    }
-
-    private func detectNewFace(in pixelBuffer: CVPixelBuffer) -> FaceDetectionResult? {
+    func detectFaces(in pixelBuffer: CVPixelBuffer, isUsingFrontCamera _: Bool) async -> [FaceDetectionResult] {
         do {
             try sequenceHandler.perform([detectionRequest], on: pixelBuffer, orientation: .up)
         } catch {
-            return nil
+            return []
         }
 
-        guard
-            let observations = detectionRequest.results,
-            let bestFace = observations
-                .filter(isPlausibleFace(_:))
-                .max(by: { score($0) < score($1) })
-        else {
-            return nil
+        guard let observations = detectionRequest.results else {
+            return []
         }
 
-        trackingRequest = makeTrackingRequest(for: bestFace.boundingBox)
+        let imageSize = sourceSize(from: pixelBuffer)
+        return observations
+            .filter(isPlausibleFace(_:))
+            .sorted { lhs, rhs in
+                let lhsCenterX = lhs.boundingBox.midX
+                let rhsCenterX = rhs.boundingBox.midX
 
-        return FaceDetectionResult.detected(
-            confidence: Double(bestFace.confidence),
-            boundingBox: normalizedTopLeftRect(from: bestFace.boundingBox),
-            sourceImageSize: sourceSize(from: pixelBuffer)
-        )
-    }
+                if abs(lhsCenterX - rhsCenterX) > 0.06 {
+                    return lhsCenterX < rhsCenterX
+                }
 
-    private func trackFace(in pixelBuffer: CVPixelBuffer) -> FaceDetectionResult? {
-        guard let trackingRequest else { return nil }
-
-        do {
-            try sequenceHandler.perform([trackingRequest], on: pixelBuffer, orientation: .up)
-        } catch {
-            return nil
-        }
-
-        guard
-            let observation = trackingRequest.results?.first as? VNDetectedObjectObservation,
-            observation.confidence >= Constants.minimumTrackingConfidence
-        else {
-            return nil
-        }
-
-        trackingRequest.inputObservation = observation
-
-        return FaceDetectionResult.detected(
-            confidence: Double(observation.confidence),
-            boundingBox: normalizedTopLeftRect(from: observation.boundingBox),
-            sourceImageSize: sourceSize(from: pixelBuffer)
-        )
-    }
-
-    private func makeTrackingRequest(for boundingBox: CGRect) -> VNTrackObjectRequest {
-        let observation = VNDetectedObjectObservation(boundingBox: boundingBox)
-        let request = VNTrackObjectRequest(detectedObjectObservation: observation)
-        request.trackingLevel = .accurate
-        return request
+                return score(lhs) > score(rhs)
+            }
+            .prefix(Constants.maximumTrackedFaces)
+            .map { observation in
+                FaceDetectionResult.detected(
+                    confidence: Double(observation.confidence),
+                    boundingBox: normalizedTopLeftRect(from: observation.boundingBox),
+                    sourceImageSize: imageSize
+                )
+            }
     }
 
     private func isPlausibleFace(_ observation: VNFaceObservation) -> Bool {

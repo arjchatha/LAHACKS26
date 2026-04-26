@@ -21,11 +21,13 @@ struct PatientCameraView: View {
 
             if viewModel.detectionResult.hasFace {
                 FaceBoundingBoxOverlay(
-                    detection: viewModel.detectionResult
+                    detection: viewModel.detectionResult,
+                    title: viewModel.focusedPersonTitle ?? "Person nearby",
+                    description: viewModel.detectedPersonDescription ?? "I see someone nearby.",
+                    onDescriptionTap: viewModel.focusNextPerson
                 )
                     .animation(.smooth(duration: 0.16), value: viewModel.detectionResult.boundingBox)
                     .ignoresSafeArea(.all)
-                    .allowsHitTesting(false)
             }
 
             if let cameraMessage = viewModel.cameraMessage {
@@ -88,6 +90,9 @@ private struct CameraMessageView: View {
 
 private struct FaceBoundingBoxOverlay: View {
     let detection: FaceDetectionResult
+    let title: String
+    let description: String
+    let onDescriptionTap: () -> Void
 
     var body: some View {
         GeometryReader { geometry in
@@ -99,10 +104,159 @@ private struct FaceBoundingBoxOverlay: View {
             let fittedRect = rect.insetBy(dx: insetAmount, dy: insetAmount)
 
             if !fittedRect.isNull && fittedRect.width > 0 && fittedRect.height > 0 {
-                LiquidTrackingBox()
-                    .frame(width: fittedRect.width, height: fittedRect.height)
-                    .position(x: fittedRect.midX, y: fittedRect.midY)
+                ZStack {
+                    LiquidTrackingBox()
+                        .frame(width: fittedRect.width, height: fittedRect.height)
+                        .position(x: fittedRect.midX, y: fittedRect.midY)
+
+                    PersonDescriptionCallout(
+                        faceRect: fittedRect,
+                        title: title,
+                        description: description,
+                        containerSize: geometry.size,
+                        onTap: onDescriptionTap
+                    )
+                }
             }
+        }
+    }
+}
+
+private struct PersonDescriptionCallout: View {
+    let faceRect: CGRect
+    let title: String
+    let description: String
+    let containerSize: CGSize
+    let onTap: () -> Void
+
+    private let calloutWidth: CGFloat = 220
+    private let calloutHeight: CGFloat = 74
+    private let connectorGap: CGFloat = 18
+    private let horizontalInset: CGFloat = 18
+
+    var body: some View {
+        let placement = placementMetrics()
+
+        ZStack {
+            ConnectorLine(
+                start: placement.connectorStart,
+                end: placement.connectorEnd
+            )
+
+            PersonDescriptionBubble(
+                title: title,
+                description: description,
+                onTap: onTap
+            )
+                .frame(width: calloutWidth)
+                .position(placement.calloutCenter)
+        }
+    }
+
+    private func placementMetrics() -> CalloutPlacement {
+        let placeAbove = faceRect.minY > calloutHeight + connectorGap + 24
+        let calloutCenterX = faceRect.midX.clamped(
+            min: horizontalInset + (calloutWidth / 2),
+            max: containerSize.width - horizontalInset - (calloutWidth / 2)
+        )
+        let connectorTarget = CGPoint(
+            x: faceRect.midX,
+            y: placeAbove ? faceRect.minY : faceRect.maxY
+        )
+        let connectorStartY = placeAbove
+            ? connectorTarget.y - connectorGap
+            : connectorTarget.y + connectorGap
+        let calloutCenterY = placeAbove
+            ? connectorStartY - (calloutHeight / 2)
+            : connectorStartY + (calloutHeight / 2)
+        let connectorStart = CGPoint(
+            x: calloutCenterX,
+            y: connectorStartY
+        )
+
+        return CalloutPlacement(
+            calloutCenter: CGPoint(x: calloutCenterX, y: calloutCenterY),
+            connectorStart: connectorStart,
+            connectorEnd: connectorTarget
+        )
+    }
+}
+
+private struct PersonDescriptionBubble: View {
+    let title: String
+    let description: String
+    let onTap: () -> Void
+
+    var body: some View {
+        let content = VStack(alignment: .leading, spacing: 6) {
+            Text(title)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.white.opacity(0.72))
+
+            Text(description)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.white)
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 12)
+
+        Button(action: onTap) {
+            Group {
+                if #available(iOS 26.0, *) {
+                    content
+                        .glassEffect(.regular.tint(.white.opacity(0.08)), in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+                        .overlay {
+                            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                                .stroke(.white.opacity(0.22), lineWidth: 1)
+                        }
+                } else {
+                    content
+                        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+                        .overlay {
+                            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                                .stroke(.white.opacity(0.18), lineWidth: 1)
+                        }
+                }
+            }
+        }
+        .buttonStyle(.plain)
+        .shadow(color: .black.opacity(0.28), radius: 18, y: 8)
+    }
+}
+
+private struct ConnectorLine: View {
+    let start: CGPoint
+    let end: CGPoint
+
+    var body: some View {
+        ZStack {
+            Path { path in
+                path.move(to: start)
+                path.addLine(to: end)
+            }
+            .stroke(.black.opacity(0.2), style: StrokeStyle(lineWidth: 5, lineCap: .round))
+
+            Path { path in
+                path.move(to: start)
+                path.addLine(to: end)
+            }
+            .stroke(
+                LinearGradient(
+                    colors: [.white.opacity(0.92), .white.opacity(0.44)],
+                    startPoint: .top,
+                    endPoint: .bottom
+                ),
+                style: StrokeStyle(lineWidth: 2, lineCap: .round)
+            )
+
+            Circle()
+                .fill(.white.opacity(0.96))
+                .frame(width: 8, height: 8)
+                .position(end)
+                .shadow(color: .white.opacity(0.2), radius: 8)
         }
     }
 }
@@ -212,5 +366,17 @@ private extension CGRect {
             width: width * displayedSize.width,
             height: height * displayedSize.height
         )
+    }
+}
+
+private struct CalloutPlacement {
+    let calloutCenter: CGPoint
+    let connectorStart: CGPoint
+    let connectorEnd: CGPoint
+}
+
+private extension CGFloat {
+    func clamped(min minimum: CGFloat, max maximum: CGFloat) -> CGFloat {
+        Swift.min(Swift.max(self, minimum), maximum)
     }
 }

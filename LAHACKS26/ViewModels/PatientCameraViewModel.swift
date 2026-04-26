@@ -12,7 +12,17 @@ import SwiftUI
 
 @MainActor
 final class PatientCameraViewModel: ObservableObject {
+    private enum Constants {
+        static let minimumFrameInterval: TimeInterval = 0.05
+        static let emptyDetectionTolerance = 8
+        static let expandDetectionsThreshold = 4
+        static let shrinkDetectionsThreshold = 6
+        static let detectionMatchDistance: CGFloat = 0.18
+    }
+
     @Published private(set) var detectionResult: FaceDetectionResult = .none
+    @Published private(set) var detectedPersonDescription: String?
+    @Published private(set) var focusedPersonTitle: String?
     @Published private(set) var cameraMessage: String?
 
     let cameraManager = CameraManager()
@@ -21,8 +31,13 @@ final class PatientCameraViewModel: ObservableObject {
     private var isProcessingFrame = false
     private var lastFrameProcessDate = Date.distantPast
     private var faceMissStreak = 0
+    private var focusedFaceIndex = 0
+    private var stableDetections: [FaceDetectionResult] = []
+    private var pendingDetections: [FaceDetectionResult] = []
+    private var pendingDetectionsStreak = 0
+    private var focusedBoundingBox: CGRect?
     private var smoothedBoundingBox: CGRect?
-    private let minimumFrameInterval: TimeInterval = 0.05
+    private let unknownPersonDescription = "I see someone nearby. Tap here to switch focus."
 
     init() {
         cameraManager.onFrame = { [weak self] pixelBuffer, isUsingFrontCamera in
@@ -50,9 +65,26 @@ final class PatientCameraViewModel: ObservableObject {
         cameraManager.stop()
     }
 
+    func focusNextPerson() {
+        guard stableDetections.count > 1 else { return }
+
+        focusedFaceIndex = (focusedFaceIndex + 1) % stableDetections.count
+        let focusedFace = stableDetections[focusedFaceIndex]
+        focusedBoundingBox = focusedFace.boundingBox
+        let smoothedResult = FaceDetectionResult.detected(
+            confidence: focusedFace.confidence,
+            boundingBox: smoothedRect(toward: focusedFace.boundingBox),
+            sourceImageSize: focusedFace.sourceImageSize
+        )
+
+        withAnimation(.smooth(duration: 0.18)) {
+            applyDetection(smoothedResult, personIndex: focusedFaceIndex, totalPeople: stableDetections.count)
+        }
+    }
+
     private func processFrame(_ pixelBuffer: CVPixelBuffer, isUsingFrontCamera: Bool) {
         let now = Date()
-        guard now.timeIntervalSince(lastFrameProcessDate) >= minimumFrameInterval else { return }
+        guard now.timeIntervalSince(lastFrameProcessDate) >= Constants.minimumFrameInterval else { return }
         guard !isProcessingFrame else { return }
 
         lastFrameProcessDate = now
@@ -62,30 +94,35 @@ final class PatientCameraViewModel: ObservableObject {
         Task { [weak self] in
             guard let self else { return }
 
-            let result = await self.faceDetectionService.detectFace(
+            let results = await self.faceDetectionService.detectFaces(
                 in: sendablePixelBuffer.value,
                 isUsingFrontCamera: isUsingFrontCamera
             )
 
             await MainActor.run {
-                self.handleDetectionResult(result)
+                self.handleDetectionResults(results)
                 self.isProcessingFrame = false
             }
         }
     }
 
-    private func handleDetectionResult(_ result: FaceDetectionResult) {
-        if result.hasFace {
+    private func handleDetectionResults(_ results: [FaceDetectionResult]) {
+        let validResults = results.filter(\.hasFace)
+        let activeDetections = resolvedStableDetections(from: validResults)
+
+        if !activeDetections.isEmpty, let focus = resolvedFocusedDetection(from: activeDetections) {
             faceMissStreak = 0
+            focusedBoundingBox = focus.detection.boundingBox
+            focusedFaceIndex = focus.index
 
             let smoothedResult = FaceDetectionResult.detected(
-                confidence: result.confidence,
-                boundingBox: smoothedRect(toward: result.boundingBox),
-                sourceImageSize: result.sourceImageSize
+                confidence: focus.detection.confidence,
+                boundingBox: smoothedRect(toward: focus.detection.boundingBox),
+                sourceImageSize: focus.detection.sourceImageSize
             )
 
             withAnimation(.smooth(duration: 0.16)) {
-                applyDetection(smoothedResult)
+                applyDetection(smoothedResult, personIndex: focus.index, totalPeople: activeDetections.count)
             }
             return
         }
@@ -93,15 +130,20 @@ final class PatientCameraViewModel: ObservableObject {
         faceMissStreak += 1
 
         if detectionResult.hasFace {
-            guard faceMissStreak >= 8 else { return }
+            guard faceMissStreak >= Constants.emptyDetectionTolerance else { return }
         } else {
             guard faceMissStreak >= 2 else { return }
         }
 
         smoothedBoundingBox = nil
+        focusedBoundingBox = nil
+        stableDetections = []
+        pendingDetections = []
+        pendingDetectionsStreak = 0
+        focusedFaceIndex = 0
 
         withAnimation(.easeOut(duration: 0.2)) {
-            applyDetection(.none)
+            applyDetection(.none, personIndex: 0, totalPeople: 0)
         }
     }
 
@@ -124,8 +166,132 @@ final class PatientCameraViewModel: ObservableObject {
         return smoothedRect
     }
 
-    private func applyDetection(_ result: FaceDetectionResult) {
+    private func applyDetection(_ result: FaceDetectionResult, personIndex: Int, totalPeople: Int) {
         detectionResult = result
+        guard result.hasFace, totalPeople > 0 else {
+            focusedPersonTitle = nil
+            detectedPersonDescription = nil
+            return
+        }
+
+        focusedPersonTitle = totalPeople > 1
+            ? "Person \(personIndex + 1) of \(totalPeople)"
+            : "Person nearby"
+        detectedPersonDescription = unknownPersonDescription
+    }
+
+    private func resolvedStableDetections(from detections: [FaceDetectionResult]) -> [FaceDetectionResult] {
+        guard !detections.isEmpty else {
+            pendingDetections = []
+            pendingDetectionsStreak = 0
+            return stableDetections
+        }
+
+        if stableDetections.isEmpty {
+            stableDetections = detections
+            pendingDetections = []
+            pendingDetectionsStreak = 0
+            return stableDetections
+        }
+
+        if shouldKeepCurrentStableDetections(with: detections) {
+            stableDetections = mergeStableDetections(current: stableDetections, incoming: detections)
+            pendingDetections = []
+            pendingDetectionsStreak = 0
+            return stableDetections
+        }
+
+        if detectionsMatchPending(detections) {
+            pendingDetectionsStreak += 1
+        } else {
+            pendingDetections = detections
+            pendingDetectionsStreak = 1
+        }
+
+        let threshold = detections.count > stableDetections.count
+            ? Constants.expandDetectionsThreshold
+            : Constants.shrinkDetectionsThreshold
+
+        guard pendingDetectionsStreak >= threshold else {
+            stableDetections = mergeStableDetections(current: stableDetections, incoming: detections)
+            return stableDetections
+        }
+
+        stableDetections = pendingDetections
+        pendingDetections = []
+        pendingDetectionsStreak = 0
+        focusedFaceIndex = min(focusedFaceIndex, max(0, stableDetections.count - 1))
+        return stableDetections
+    }
+
+    private func resolvedFocusedDetection(from detections: [FaceDetectionResult]) -> (index: Int, detection: FaceDetectionResult)? {
+        guard !detections.isEmpty else { return nil }
+
+        if let focusedBoundingBox,
+           let bestIndex = detections.indices.min(by: { lhs, rhs in
+               detections[lhs].boundingBox.center.distance(to: focusedBoundingBox.center)
+                   < detections[rhs].boundingBox.center.distance(to: focusedBoundingBox.center)
+           }),
+           detections[bestIndex].boundingBox.center.distance(to: focusedBoundingBox.center) <= Constants.detectionMatchDistance {
+            return (bestIndex, detections[bestIndex])
+        }
+
+        let safeIndex = min(focusedFaceIndex, detections.count - 1)
+        return (safeIndex, detections[safeIndex])
+    }
+
+    private func shouldKeepCurrentStableDetections(with detections: [FaceDetectionResult]) -> Bool {
+        if detections.count == stableDetections.count {
+            return true
+        }
+
+        let overlapCount = stableDetections.reduce(into: 0) { count, stable in
+            let hasMatch = detections.contains { incoming in
+                stable.boundingBox.center.distance(to: incoming.boundingBox.center) <= Constants.detectionMatchDistance
+            }
+            if hasMatch {
+                count += 1
+            }
+        }
+
+        return overlapCount == min(stableDetections.count, detections.count)
+    }
+
+    private func mergeStableDetections(current: [FaceDetectionResult], incoming: [FaceDetectionResult]) -> [FaceDetectionResult] {
+        guard !incoming.isEmpty else { return current }
+
+        var remainingIncoming = incoming
+        var merged: [FaceDetectionResult] = []
+
+        for stable in current {
+            guard let bestMatchIndex = remainingIncoming.indices.min(by: { lhs, rhs in
+                remainingIncoming[lhs].boundingBox.center.distance(to: stable.boundingBox.center)
+                    < remainingIncoming[rhs].boundingBox.center.distance(to: stable.boundingBox.center)
+            }) else {
+                merged.append(stable)
+                continue
+            }
+
+            let bestMatch = remainingIncoming[bestMatchIndex]
+            let distance = bestMatch.boundingBox.center.distance(to: stable.boundingBox.center)
+
+            if distance <= Constants.detectionMatchDistance {
+                merged.append(bestMatch)
+                remainingIncoming.remove(at: bestMatchIndex)
+            } else {
+                merged.append(stable)
+            }
+        }
+
+        return merged
+    }
+
+    private func detectionsMatchPending(_ detections: [FaceDetectionResult]) -> Bool {
+        guard detections.count == pendingDetections.count else { return false }
+
+        return zip(detections, pendingDetections).allSatisfy { lhs, rhs in
+            lhs.boundingBox.center.distance(to: rhs.boundingBox.center) <= Constants.detectionMatchDistance
+        }
     }
 }
 
@@ -141,5 +307,15 @@ private extension CGRect {
             width: size.width + (target.size.width - size.width) * amount,
             height: size.height + (target.size.height - size.height) * amount
         )
+    }
+
+    var center: CGPoint {
+        CGPoint(x: midX, y: midY)
+    }
+}
+
+private extension CGPoint {
+    func distance(to point: CGPoint) -> CGFloat {
+        hypot(x - point.x, y - point.y)
     }
 }
