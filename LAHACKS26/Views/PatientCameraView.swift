@@ -33,6 +33,10 @@ struct PatientCameraView: View {
         let profileDisplay = viewModel.detectionResult.faceProfileId.map {
             memoryBridge.profileDisplay(for: $0)
         } ?? .unknown("Unknown face")
+        let cameraLabelTitle = viewModel.activeEnrollmentName ?? profileDisplay.cameraLabelTitle
+        let cameraLabelDescription = viewModel.activeEnrollmentName == nil
+            ? profileDisplay.cameraLabelDescription
+            : "Learning this face"
 
         GeometryReader { geometry in
             let islandTopOffset = dynamicIslandTopOffset(in: geometry)
@@ -49,8 +53,8 @@ struct PatientCameraView: View {
                 if viewModel.detectionResult.hasFace {
                     FaceBoundingBoxOverlay(
                         detection: viewModel.detectionResult,
-                        title: profileDisplay.cameraLabelTitle,
-                        description: profileDisplay.cameraLabelDescription
+                        title: cameraLabelTitle,
+                        description: cameraLabelDescription
                     )
                         .frame(width: geometry.size.width, height: geometry.size.height)
                         .animation(.smooth(duration: 0.16), value: viewModel.detectionResult.boundingBox)
@@ -243,6 +247,7 @@ struct PatientCameraView: View {
         }
 
         showSaveBanner(SaveBanner(id: event.id, title: title, subtitle: event.subtitle))
+        memoryCoordinator.clearLatestEvent()
     }
 
     private func showSaveBanner(_ banner: SaveBanner) {
@@ -251,15 +256,12 @@ struct PatientCameraView: View {
         saveBannerExpanded = false
         saveBannerContentVisible = false
 
+        withAnimation(.smooth(duration: 0.42, extraBounce: 0.10)) {
+            saveBannerExpanded = true
+        }
+
         saveBannerTask = Task { @MainActor in
-            try? await Task.sleep(for: .milliseconds(70))
-            guard saveBanner?.id == banner.id else { return }
-
-            withAnimation(.smooth(duration: 0.42, extraBounce: 0.10)) {
-                saveBannerExpanded = true
-            }
-
-            try? await Task.sleep(for: .milliseconds(220))
+            try? await Task.sleep(for: .milliseconds(90))
             guard saveBanner?.id == banner.id else { return }
 
             withAnimation(.easeOut(duration: 0.16)) {
@@ -351,20 +353,133 @@ private struct EnrollmentStatusPill: View {
     let progress: Int
     let target: Int
 
+    private var progressFraction: CGFloat {
+        guard target > 0 else { return 0 }
+        return min(1, max(0, CGFloat(progress) / CGFloat(target)))
+    }
+
     var body: some View {
-        Text("Learning \(name) \(progress)/\(target)")
-            .font(.subheadline.weight(.semibold))
-            .foregroundStyle(.white)
-            .lineLimit(1)
-            .minimumScaleFactor(0.82)
-            .padding(.horizontal, 16)
-            .frame(height: 42)
-            .background(.black.opacity(0.58), in: Capsule())
-            .overlay {
-                Capsule()
-                    .stroke(.white.opacity(0.18), lineWidth: 1)
+        let content = HStack(spacing: 12) {
+            ZStack {
+                Circle()
+                    .fill(.white.opacity(0.10))
+
+                Circle()
+                    .stroke(.white.opacity(0.18), lineWidth: 4)
+
+                Circle()
+                    .trim(from: 0, to: progressFraction)
+                    .stroke(
+                        AngularGradient(
+                            colors: [
+                                .white.opacity(0.96),
+                                Color(red: 0.52, green: 1.0, blue: 0.62),
+                                Color(red: 0.22, green: 0.78, blue: 0.36)
+                            ],
+                            center: .center
+                        ),
+                        style: StrokeStyle(lineWidth: 4, lineCap: .round)
+                    )
+                    .rotationEffect(.degrees(-90))
             }
-            .shadow(color: .black.opacity(0.22), radius: 14, y: 6)
+            .frame(width: 38, height: 38)
+
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 8) {
+                    Text("Learning...")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.white)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.82)
+
+                    Spacer(minLength: 8)
+
+                    Text("\(progress)/\(max(target, 1))")
+                        .font(.caption.monospacedDigit().weight(.bold))
+                        .foregroundStyle(.white.opacity(0.72))
+                }
+
+                GeometryReader { geometry in
+                    ZStack(alignment: .leading) {
+                        Capsule()
+                            .fill(.white.opacity(0.13))
+                            .overlay(alignment: .top) {
+                                Capsule()
+                                    .fill(.white.opacity(0.16))
+                                    .frame(height: 2)
+                                    .padding(.horizontal, 1)
+                            }
+
+                        Capsule()
+                            .fill(
+                                LinearGradient(
+                                    colors: [
+                                        .white.opacity(0.96),
+                                        Color(red: 0.49, green: 0.96, blue: 0.58),
+                                        Color(red: 0.20, green: 0.74, blue: 0.34)
+                                    ],
+                                    startPoint: .leading,
+                                    endPoint: .trailing
+                                )
+                            )
+                            .frame(width: max(7, geometry.size.width * progressFraction))
+                    }
+                }
+                .frame(height: 7)
+            }
+        }
+        .padding(.horizontal, 13)
+        .padding(.vertical, 11)
+        .frame(width: 272)
+        .background {
+            RoundedRectangle(cornerRadius: 28, style: .continuous)
+                .fill(
+                    LinearGradient(
+                        colors: [
+                            .white.opacity(0.15),
+                            .white.opacity(0.05)
+                        ],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                )
+        }
+
+        Group {
+            if #available(iOS 26.0, *) {
+                content
+                    .glassEffect(.regular.tint(.white.opacity(0.08)), in: RoundedRectangle(cornerRadius: 28, style: .continuous))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 28, style: .continuous)
+                            .stroke(
+                                LinearGradient(
+                                    colors: [.white.opacity(0.46), .white.opacity(0.12)],
+                                    startPoint: .topLeading,
+                                    endPoint: .bottomTrailing
+                                ),
+                                lineWidth: 1
+                            )
+                    }
+                    .overlay(alignment: .topLeading) {
+                        Capsule()
+                            .fill(.white.opacity(0.22))
+                            .frame(width: 92, height: 1)
+                            .padding(.top, 8)
+                            .padding(.leading, 22)
+                    }
+            } else {
+                content
+                    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 28, style: .continuous))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 28, style: .continuous)
+                            .stroke(.white.opacity(0.24), lineWidth: 1)
+                    }
+            }
+        }
+        .compositingGroup()
+        .shadow(color: .black.opacity(0.32), radius: 20, y: 9)
+        .shadow(color: .white.opacity(0.08), radius: 10)
+        .animation(.smooth(duration: 0.24), value: progressFraction)
     }
 }
 
@@ -387,6 +502,10 @@ private struct SaveBannerView: View {
     private var shapeWidth: CGFloat { isExpanded ? expandedWidth : compactWidth }
     private var shapeHeight: CGFloat { isExpanded ? expandedHeight : compactHeight }
     private var shapeRadius: CGFloat { isExpanded ? 46 : 18 }
+
+    private var titleText: String {
+        banner.title.localizedCaseInsensitiveCompare("memory saved") == .orderedSame ? "Memory Saved" : banner.title
+    }
 
     private var subtitleText: String {
         if let subtitle = banner.subtitle, !subtitle.isEmpty {
@@ -434,7 +553,7 @@ private struct SaveBannerView: View {
             .frame(width: 50, height: 50)
 
             VStack(alignment: .leading, spacing: 1) {
-                Text(banner.title)
+                Text(titleText)
                     .font(.headline.weight(.semibold))
                     .foregroundStyle(.white)
                     .lineLimit(1)
@@ -493,9 +612,17 @@ private struct PersonDescriptionCallout: View {
     let description: String
     let containerSize: CGSize
 
-    private let calloutWidth: CGFloat = 232
     private let connectorGap: CGFloat = 18
     private let horizontalInset: CGFloat = 18
+
+    private var calloutWidth: CGFloat {
+        let cleanedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanedDescription = description.trimmingCharacters(in: .whitespacesAndNewlines)
+        let longestTextCount = max(cleanedTitle.count, cleanedDescription.count)
+        let estimatedTextWidth = CGFloat(longestTextCount) * 7.8 + 38
+        let minimumWidth: CGFloat = cleanedDescription.isEmpty ? 98 : 140
+        return estimatedTextWidth.clamped(min: minimumWidth, max: 244)
+    }
 
     private var calloutHeight: CGFloat {
         description.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? 64 : 86

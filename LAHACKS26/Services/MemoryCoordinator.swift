@@ -108,6 +108,7 @@ final class MemoryCoordinator: ObservableObject {
         transcriptSegments = []
         currentTranscript = ""
         lastCommittedTranscript = ""
+        lastStoredSignature = ""
         lastSavedEvidenceQuote = ""
         lastLocalSaveDate = .distantPast
         transcriptCommitTask?.cancel()
@@ -177,6 +178,23 @@ final class MemoryCoordinator: ObservableObject {
         latestEvent = nil
     }
 
+    private func publishSaveEvent(
+        kind: MemoryCoordinatorEvent.Kind,
+        title: String,
+        subtitle: String?,
+        patientSafeResponse: String?
+    ) {
+        latestEvent = nil
+        let event = MemoryCoordinatorEvent(
+            kind: kind,
+            title: title,
+            subtitle: subtitle,
+            patientSafeResponse: patientSafeResponse
+        )
+        latestEvent = event
+        print("MindAnchor save island event: \(title), subtitle=\(subtitle ?? "none")")
+    }
+
     private func scheduleTranscriptCommit() {
         transcriptCommitTask?.cancel()
         transcriptCommitTask = Task { [weak self] in
@@ -231,6 +249,10 @@ final class MemoryCoordinator: ObservableObject {
 
     private func storeLocalPersonIfNeeded(from transcript: String) -> Bool {
         guard canStoreForActiveFace else { return false }
+        if let candidate = localExtractor.extractPersonProfile(from: transcript) {
+            return storeLocalPersonCandidate(candidate, transcript: transcript)
+        }
+
         if let activeMemory = activePersonMemoryForCurrentFace() {
             return storeLocalContextForActiveMemoryIfNeeded(
                 from: transcript,
@@ -238,11 +260,7 @@ final class MemoryCoordinator: ObservableObject {
             )
         }
 
-        guard let candidate = localExtractor.extractPersonProfile(from: transcript) else {
-            return storeLocalContextForActiveDraftIfNeeded(from: transcript)
-        }
-
-        return storeLocalPersonCandidate(candidate, transcript: transcript)
+        return storeLocalContextForActiveDraftIfNeeded(from: transcript)
     }
 
     private func storeLocalPersonCandidate(_ candidate: LocalPersonProfileCandidate, transcript: String) -> Bool {
@@ -258,7 +276,7 @@ final class MemoryCoordinator: ObservableObject {
         ].joined(separator: "|").lowercased()
         guard !signature.isEmpty, signature != lastStoredSignature else { return false }
 
-        latestEvent = MemoryCoordinatorEvent(
+        publishSaveEvent(
             kind: .saving,
             title: "Saving",
             subtitle: candidate.name,
@@ -314,7 +332,7 @@ final class MemoryCoordinator: ObservableObject {
 
         Task { @MainActor in
             try? await Task.sleep(for: .milliseconds(180))
-            latestEvent = MemoryCoordinatorEvent(
+            publishSaveEvent(
                 kind: .stored,
                 title: "Saved",
                 subtitle: memory.name,
@@ -377,7 +395,7 @@ final class MemoryCoordinator: ObservableObject {
         ].joined(separator: "|").lowercased()
         guard !signature.isEmpty, signature != lastStoredSignature else { return false }
 
-        latestEvent = MemoryCoordinatorEvent(
+        publishSaveEvent(
             kind: .saving,
             title: "Saving",
             subtitle: activeMemory.name,
@@ -404,7 +422,7 @@ final class MemoryCoordinator: ObservableObject {
 
         Task { @MainActor in
             try? await Task.sleep(for: .milliseconds(180))
-            latestEvent = MemoryCoordinatorEvent(
+            publishSaveEvent(
                 kind: .stored,
                 title: "Saved",
                 subtitle: memory.name,
@@ -435,7 +453,7 @@ final class MemoryCoordinator: ObservableObject {
         ].joined(separator: "|").lowercased()
         guard !signature.isEmpty, signature != lastStoredSignature else { return }
 
-        latestEvent = MemoryCoordinatorEvent(
+        publishSaveEvent(
             kind: .saving,
             title: "Saving",
             subtitle: nil,
@@ -462,7 +480,7 @@ final class MemoryCoordinator: ObservableObject {
         print("MindAnchor local interaction memory saved:", memory.summary)
         Task { @MainActor in
             try? await Task.sleep(for: .milliseconds(180))
-            latestEvent = MemoryCoordinatorEvent(
+            publishSaveEvent(
                 kind: .stored,
                 title: "Saved",
                 subtitle: nil,
