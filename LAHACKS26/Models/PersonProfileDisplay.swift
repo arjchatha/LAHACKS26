@@ -36,6 +36,19 @@ struct StoredPersonPhotoProfile: Codable, Identifiable, Equatable {
     }
 }
 
+struct StoredLivePersonProfile: Codable, Identifiable, Equatable {
+    let profile: PersonProfileDisplay
+    let embedding: [Float]
+    let transcriptEvidence: [String]
+    let faceSampleCount: Int
+    let createdAt: Date
+    let updatedAt: Date
+
+    var id: String {
+        profile.personId
+    }
+}
+
 enum PersonProfileDisplayResult: Equatable {
     case approved(PersonProfileDisplay)
     case unknown(String)

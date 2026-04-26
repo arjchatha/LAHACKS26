@@ -21,6 +21,11 @@ struct FaceRecognitionMatch {
     let similarity: Float
 }
 
+struct FaceRecognitionDecision {
+    let acceptedMatch: FaceRecognitionMatch?
+    let bestCandidate: FaceRecognitionMatch?
+}
+
 enum FaceRecognitionError: LocalizedError {
     case noUsableFacesInPhotos
     case faceDetectedButEmbeddingFailed(detectedFaceCount: Int, totalPhotoCount: Int)
@@ -42,11 +47,12 @@ final class FaceRecognitionService {
     private enum Constants {
         static let maximumEnrollmentPhotos = 20
         static let minimumFaceArea: CGFloat = 0.006
-        static let minimumSimilarity: Float = 0.65
-        static let minimumMatchMargin: Float = 0.08
+        static let minimumSimilarity: Float = 0.45
+        static let minimumMatchMargin: Float = 0
     }
 
     private let cropper = FaceCropper()
+    private let aligner = ArcFaceAligner()
     private let embeddingService: ZeticFaceEmbeddingService
 
     init() throws {
@@ -67,16 +73,16 @@ final class FaceRecognitionService {
         var detectedFaceCount = 0
 
         for image in images {
-            guard let faceRect = bestFaceRect(in: image) else { continue }
+            guard let faceObservation = bestFaceObservation(in: image) else { continue }
             detectedFaceCount += 1
 
             do {
-                let candidateImages = try cropper.croppedFaceImages(
+                let faceImage = try recognitionFaceImage(
                     from: image,
-                    topLeftNormalizedFaceRect: faceRect
+                    observation: faceObservation
                 )
-                let embedding = try firstEmbedding(from: candidateImages)
-                embeddings.append(FaceEmbeddingMath.l2Normalized(embedding))
+                let embedding = try embeddingService.embedding(for: faceImage)
+                embeddings.append(embedding)
             } catch {
                 continue
             }
@@ -100,15 +106,26 @@ final class FaceRecognitionService {
     }
 
     func liveEmbedding(from pixelBuffer: CVPixelBuffer, detection: FaceDetectionResult) throws -> [Float] {
+        let image = try cropper.image(from: pixelBuffer)
+
+        if let observation = matchedFaceObservation(in: pixelBuffer, matching: detection),
+           let alignedImage = aligner.alignedFaceImage(from: image, observation: observation) {
+            return try FaceEmbeddingMath.l2Normalized(embeddingService.embedding(for: alignedImage))
+        }
+
         let candidateImages = try cropper.croppedFaceImages(
-            from: pixelBuffer,
-            faceRect: detection.boundingBox
+            from: image,
+            topLeftNormalizedFaceRect: detection.boundingBox,
+            paddingScales: [0.20]
         )
-        let embedding = try firstEmbedding(from: candidateImages)
-        return FaceEmbeddingMath.l2Normalized(embedding)
+        return try averagedEmbedding(from: candidateImages)
     }
 
     func bestMatch(for embedding: [Float], candidates: [FaceEmbeddingCandidate]) -> FaceRecognitionMatch? {
+        recognitionDecision(for: embedding, candidates: candidates).acceptedMatch
+    }
+
+    func recognitionDecision(for embedding: [Float], candidates: [FaceEmbeddingCandidate]) -> FaceRecognitionDecision {
         let matches = candidates.compactMap { candidate -> FaceRecognitionMatch? in
             guard let similarity = FaceEmbeddingMath.cosineSimilarity(embedding, candidate.embedding) else {
                 return nil
@@ -121,66 +138,97 @@ final class FaceRecognitionService {
         }
         .sorted { $0.similarity > $1.similarity }
 
+        guard let bestCandidate = matches.first else {
+            return FaceRecognitionDecision(acceptedMatch: nil, bestCandidate: nil)
+        }
+
         guard let bestMatch = matches.first, bestMatch.similarity >= Constants.minimumSimilarity else {
-            return nil
+            return FaceRecognitionDecision(acceptedMatch: nil, bestCandidate: bestCandidate)
         }
 
-        if let runnerUp = matches.dropFirst().first,
+        if Constants.minimumMatchMargin > 0,
+           let runnerUp = matches.dropFirst().first,
            bestMatch.similarity - runnerUp.similarity < Constants.minimumMatchMargin {
-            return nil
+            return FaceRecognitionDecision(acceptedMatch: nil, bestCandidate: bestCandidate)
         }
 
-        return bestMatch
+        return FaceRecognitionDecision(acceptedMatch: bestMatch, bestCandidate: bestCandidate)
     }
 
-    private func firstEmbedding(from candidateImages: [CGImage]) throws -> [Float] {
-        for image in candidateImages {
-            if let embedding = try? embeddingService.embedding(for: image) {
-                return embedding
-            }
-        }
-
-        throw ZeticFaceEmbeddingError.noEmbeddingOutput
-    }
-
-    private func bestFaceRect(in image: CGImage) -> CGRect? {
-        let orientations: [CGImagePropertyOrientation] = [.up, .right, .left, .down]
-
-        let bestObservation = orientations.compactMap { orientation -> (CGImagePropertyOrientation, VNFaceObservation)? in
-            let request = VNDetectFaceRectanglesRequest()
-            let handler = VNImageRequestHandler(cgImage: image, orientation: orientation, options: [:])
-
-            do {
-                try handler.perform([request])
-            } catch {
+    private func averagedEmbedding(from candidateImages: [CGImage]) throws -> [Float] {
+        let embeddings = candidateImages.compactMap { image -> [Float]? in
+            guard let embedding = try? embeddingService.embedding(for: image) else {
                 return nil
             }
 
-            guard let observation = request.results?
-                .filter({ candidate in
-                    let area = candidate.boundingBox.width * candidate.boundingBox.height
-                    return area >= Constants.minimumFaceArea
-                })
-                .max(by: { lhs, rhs in
-                    (lhs.boundingBox.width * lhs.boundingBox.height) < (rhs.boundingBox.width * rhs.boundingBox.height)
-                })
-            else {
-                return nil
-            }
-
-            return (orientation, observation)
+            return FaceEmbeddingMath.l2Normalized(embedding)
         }
-        .max(by: { lhs, rhs in
-            let lhsArea = lhs.1.boundingBox.width * lhs.1.boundingBox.height
-            let rhsArea = rhs.1.boundingBox.width * rhs.1.boundingBox.height
-            return lhsArea < rhsArea
-        })
 
-        guard let (orientation, observation) = bestObservation else {
+        guard !embeddings.isEmpty else {
+            throw ZeticFaceEmbeddingError.noEmbeddingOutput
+        }
+
+        return FaceEmbeddingMath.l2Normalized(average(embeddings))
+    }
+
+    private func recognitionFaceImage(from image: CGImage, observation: VNFaceObservation) throws -> CGImage {
+        if let alignedImage = aligner.alignedFaceImage(from: image, observation: observation) {
+            return alignedImage
+        }
+
+        let images = try cropper.croppedFaceImages(
+            from: image,
+            topLeftNormalizedFaceRect: normalizedTopLeftRect(from: observation.boundingBox),
+            paddingScales: [0.20]
+        )
+        guard let image = images.first else {
+            throw FaceCropperError.invalidFaceRect
+        }
+        return image
+    }
+
+    private func bestFaceObservation(in image: CGImage) -> VNFaceObservation? {
+        let request = VNDetectFaceLandmarksRequest()
+        let handler = VNImageRequestHandler(cgImage: image, orientation: .up, options: [:])
+
+        do {
+            try handler.perform([request])
+        } catch {
             return nil
         }
 
-        return normalizedTopLeftRect(from: observation.boundingBox, orientation: orientation)
+        return request.results?
+            .filter { observation in
+                let area = observation.boundingBox.width * observation.boundingBox.height
+                return area >= Constants.minimumFaceArea
+            }
+            .max { lhs, rhs in
+                (lhs.boundingBox.width * lhs.boundingBox.height) < (rhs.boundingBox.width * rhs.boundingBox.height)
+            }
+    }
+
+    private func matchedFaceObservation(
+        in pixelBuffer: CVPixelBuffer,
+        matching detection: FaceDetectionResult
+    ) -> VNFaceObservation? {
+        let request = VNDetectFaceLandmarksRequest()
+        let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up, options: [:])
+
+        do {
+            try handler.perform([request])
+        } catch {
+            return nil
+        }
+
+        return request.results?
+            .filter { observation in
+                let area = observation.boundingBox.width * observation.boundingBox.height
+                return area >= Constants.minimumFaceArea
+            }
+            .min { lhs, rhs in
+                normalizedTopLeftRect(from: lhs.boundingBox).center.distance(to: detection.boundingBox.center)
+                    < normalizedTopLeftRect(from: rhs.boundingBox).center.distance(to: detection.boundingBox.center)
+            }
     }
 
     private func normalizedTopLeftRect(
@@ -243,6 +291,10 @@ final class FaceRecognitionService {
 }
 
 private extension CGRect {
+    var center: CGPoint {
+        CGPoint(x: midX, y: midY)
+    }
+
     func clampedToUnitRect() -> CGRect {
         let minX = max(0, min(1, origin.x))
         let minY = max(0, min(1, origin.y))
@@ -255,6 +307,12 @@ private extension CGRect {
             width: max(0, maxX - minX),
             height: max(0, maxY - minY)
         )
+    }
+}
+
+private extension CGPoint {
+    func distance(to point: CGPoint) -> CGFloat {
+        hypot(x - point.x, y - point.y)
     }
 }
 

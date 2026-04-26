@@ -103,13 +103,7 @@ final class CameraManager: NSObject, ObservableObject {
 
         isUsingFrontCamera = false
         session.beginConfiguration()
-        if session.canSetSessionPreset(.hd1920x1080) {
-            session.sessionPreset = .hd1920x1080
-        } else if session.canSetSessionPreset(.hd1280x720) {
-            session.sessionPreset = .hd1280x720
-        } else {
-            session.sessionPreset = .high
-        }
+        session.sessionPreset = .high
 
         defer {
             session.commitConfiguration()

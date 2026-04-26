@@ -415,8 +415,9 @@
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_NSCameraUsageDescription = "This app uses the camera to recognize familiar faces and show supportive memory cues during conversations.";
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
-				INFOPLIST_KEY_NSMicrophoneUsageDescription = "This app keeps audio access available for future caregiver capture workflows.";
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "MindAnchor uses the microphone to transcribe introductions and build live memory profiles.";
 				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "This app lets caregivers choose local photos to create approved face profiles.";
+				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "MindAnchor uses speech recognition to build live memory profiles from spoken introductions.";
 				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -456,8 +457,9 @@
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_NSCameraUsageDescription = "This app uses the camera to recognize familiar faces and show supportive memory cues during conversations.";
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
-				INFOPLIST_KEY_NSMicrophoneUsageDescription = "This app keeps audio access available for future caregiver capture workflows.";
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "MindAnchor uses the microphone to transcribe introductions and build live memory profiles.";
 				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "This app lets caregivers choose local photos to create approved face profiles.";
+				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "MindAnchor uses speech recognition to build live memory profiles from spoken introductions.";
 				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",

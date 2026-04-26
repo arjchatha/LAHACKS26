@@ -16,7 +16,12 @@ protocol MemoryBridge: AnyObject {
     func recognizeApprovedPerson(faceProfileId: String) -> String
     func profileDisplay(for faceProfileId: String) -> PersonProfileDisplayResult
     func approvedProfileDisplays() -> [PersonProfileDisplay]
+    func faceRecognitionDecision(for detection: FaceDetectionResult, in pixelBuffer: CVPixelBuffer) -> FaceRecognitionDecision?
     func recognizedFaceProfileId(for detection: FaceDetectionResult, in pixelBuffer: CVPixelBuffer) -> String?
+    func faceEmbedding(for detection: FaceDetectionResult, in pixelBuffer: CVPixelBuffer) -> [Float]?
+    func saveLiveProfile(name: String, transcript: String, embeddings: [[Float]]) throws -> PersonProfileDisplay
+    func appendTranscript(_ transcript: String, to faceProfileId: String)
+    func updateLiveProfileSummary(_ summary: String, for faceProfileId: String)
     func approvePersonEnrollment(personId: String, caregiverName: String)
 }
 
@@ -55,6 +60,7 @@ final class MockMemoryBridge: ObservableObject, MemoryBridge {
     ]
     private var enrollmentFaceProfilesBySessionId: [String: String] = [:]
     @Published private(set) var enrolledPhotoProfiles: [StoredPersonPhotoProfile] = []
+    @Published private(set) var enrolledLiveProfiles: [StoredLivePersonProfile] = []
 
     private let faceRecognitionService = try? FaceRecognitionService()
     private var embeddingsByFaceProfileId: [String: [Float]] = [:]
@@ -99,6 +105,7 @@ final class MockMemoryBridge: ObservableObject, MemoryBridge {
 
     init() {
         loadStoredPhotoProfiles()
+        loadStoredLiveProfiles()
     }
 
     func startPersonEnrollmentSession() -> String {
@@ -141,11 +148,12 @@ final class MockMemoryBridge: ObservableObject, MemoryBridge {
             }
     }
 
-    func recognizedFaceProfileId(for detection: FaceDetectionResult, in pixelBuffer: CVPixelBuffer) -> String? {
+    func faceRecognitionDecision(for detection: FaceDetectionResult, in pixelBuffer: CVPixelBuffer) -> FaceRecognitionDecision? {
         guard detection.hasFace, detection.confidence >= 0.28 else { return nil }
 
         if let faceProfileId = detection.faceProfileId, approvedFaceProfileIds.contains(faceProfileId) {
-            return faceProfileId
+            let match = FaceRecognitionMatch(faceProfileId: faceProfileId, similarity: Float(detection.confidence))
+            return FaceRecognitionDecision(acceptedMatch: match, bestCandidate: match)
         }
 
         guard
@@ -160,7 +168,164 @@ final class MockMemoryBridge: ObservableObject, MemoryBridge {
             FaceEmbeddingCandidate(faceProfileId: faceProfileId, embedding: embedding)
         }
 
-        return faceRecognitionService.bestMatch(for: embedding, candidates: candidates)?.faceProfileId
+        return faceRecognitionService.recognitionDecision(for: embedding, candidates: candidates)
+    }
+
+    func recognizedFaceProfileId(for detection: FaceDetectionResult, in pixelBuffer: CVPixelBuffer) -> String? {
+        faceRecognitionDecision(for: detection, in: pixelBuffer)?.acceptedMatch?.faceProfileId
+    }
+
+    func faceEmbedding(for detection: FaceDetectionResult, in pixelBuffer: CVPixelBuffer) -> [Float]? {
+        guard detection.hasFace, let faceRecognitionService else { return nil }
+        return try? faceRecognitionService.liveEmbedding(from: pixelBuffer, detection: detection)
+    }
+
+    @discardableResult
+    func saveLiveProfile(
+        name: String,
+        transcript: String,
+        embeddings: [[Float]]
+    ) throws -> PersonProfileDisplay {
+        let cleanName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanTranscript = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanName.isEmpty, !embeddings.isEmpty else {
+            throw ProfilePhotoStorageError.invalidEmbeddingData
+        }
+
+        let embedding = FaceEmbeddingMath.l2Normalized(average(embeddings))
+        guard !embedding.isEmpty, embedding.allSatisfy(\.isFinite) else {
+            throw ProfilePhotoStorageError.invalidEmbeddingData
+        }
+
+        let now = Date()
+        let evidenceEntries = transcriptEvidenceEntries(from: cleanTranscript)
+
+        if let index = enrolledLiveProfiles.firstIndex(where: {
+            $0.profile.name.localizedCaseInsensitiveCompare(cleanName) == .orderedSame
+        }) {
+            let existing = enrolledLiveProfiles[index]
+            let mergedEvidence = uniqueTranscriptEvidence(existing.transcriptEvidence + evidenceEntries)
+            let mergedEmbedding = FaceEmbeddingMath.l2Normalized(average([existing.embedding, embedding]))
+            let updatedProfile = PersonProfileDisplay(
+                personId: existing.profile.personId,
+                faceProfileId: existing.profile.faceProfileId,
+                name: cleanName,
+                relationship: existing.profile.relationship,
+                memoryCue: memoryCue(for: cleanName, transcriptEvidence: mergedEvidence),
+                detailLines: detailLines(faceSampleCount: existing.faceSampleCount + embeddings.count, transcriptEvidence: mergedEvidence),
+                caregiverApproved: true
+            )
+            let updatedStoredProfile = StoredLivePersonProfile(
+                profile: updatedProfile,
+                embedding: mergedEmbedding,
+                transcriptEvidence: mergedEvidence,
+                faceSampleCount: existing.faceSampleCount + embeddings.count,
+                createdAt: existing.createdAt,
+                updatedAt: now
+            )
+
+            enrolledLiveProfiles[index] = updatedStoredProfile
+            approvedFaceProfileIds.insert(updatedProfile.faceProfileId)
+            approvedProfilesByFaceProfileId[updatedProfile.faceProfileId] = updatedProfile
+            embeddingsByFaceProfileId[updatedProfile.faceProfileId] = mergedEmbedding
+            try saveStoredLiveProfiles()
+            return updatedProfile
+        }
+
+        let personId = "person-live-\(UUID().uuidString.prefix(8))"
+        let faceProfileId = "face-live-\(UUID().uuidString.prefix(8))"
+        let profile = PersonProfileDisplay(
+            personId: personId,
+            faceProfileId: faceProfileId,
+            name: cleanName,
+            relationship: "",
+            memoryCue: memoryCue(for: cleanName, transcriptEvidence: evidenceEntries),
+            detailLines: detailLines(faceSampleCount: embeddings.count, transcriptEvidence: evidenceEntries),
+            caregiverApproved: true
+        )
+
+        let storedProfile = StoredLivePersonProfile(
+            profile: profile,
+            embedding: embedding,
+            transcriptEvidence: evidenceEntries,
+            faceSampleCount: embeddings.count,
+            createdAt: now,
+            updatedAt: now
+        )
+
+        approvedFaceProfileIds.insert(faceProfileId)
+        approvedProfilesByFaceProfileId[faceProfileId] = profile
+        embeddingsByFaceProfileId[faceProfileId] = embedding
+        enrolledLiveProfiles.append(storedProfile)
+        try saveStoredLiveProfiles()
+        return profile
+    }
+
+    func appendTranscript(_ transcript: String, to faceProfileId: String) {
+        let evidenceEntries = transcriptEvidenceEntries(from: transcript)
+        guard
+            !evidenceEntries.isEmpty,
+            let index = enrolledLiveProfiles.firstIndex(where: { $0.profile.faceProfileId == faceProfileId })
+        else {
+            return
+        }
+
+        let existing = enrolledLiveProfiles[index]
+        let mergedEvidence = uniqueTranscriptEvidence(existing.transcriptEvidence + evidenceEntries)
+        guard mergedEvidence != existing.transcriptEvidence else { return }
+
+        let updatedProfile = PersonProfileDisplay(
+            personId: existing.profile.personId,
+            faceProfileId: existing.profile.faceProfileId,
+            name: existing.profile.name,
+            relationship: existing.profile.relationship,
+            memoryCue: memoryCue(for: existing.profile.name, transcriptEvidence: mergedEvidence),
+            detailLines: detailLines(faceSampleCount: existing.faceSampleCount, transcriptEvidence: mergedEvidence),
+            caregiverApproved: true
+        )
+
+        enrolledLiveProfiles[index] = StoredLivePersonProfile(
+            profile: updatedProfile,
+            embedding: existing.embedding,
+            transcriptEvidence: mergedEvidence,
+            faceSampleCount: existing.faceSampleCount,
+            createdAt: existing.createdAt,
+            updatedAt: Date()
+        )
+        approvedProfilesByFaceProfileId[faceProfileId] = updatedProfile
+        try? saveStoredLiveProfiles()
+    }
+
+    func updateLiveProfileSummary(_ summary: String, for faceProfileId: String) {
+        let cleanSummary = summary.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard
+            !cleanSummary.isEmpty,
+            let index = enrolledLiveProfiles.firstIndex(where: { $0.profile.faceProfileId == faceProfileId })
+        else {
+            return
+        }
+
+        let existing = enrolledLiveProfiles[index]
+        let updatedProfile = PersonProfileDisplay(
+            personId: existing.profile.personId,
+            faceProfileId: existing.profile.faceProfileId,
+            name: existing.profile.name,
+            relationship: existing.profile.relationship,
+            memoryCue: cleanSummary,
+            detailLines: detailLines(faceSampleCount: existing.faceSampleCount, transcriptEvidence: existing.transcriptEvidence),
+            caregiverApproved: true
+        )
+
+        enrolledLiveProfiles[index] = StoredLivePersonProfile(
+            profile: updatedProfile,
+            embedding: existing.embedding,
+            transcriptEvidence: existing.transcriptEvidence,
+            faceSampleCount: existing.faceSampleCount,
+            createdAt: existing.createdAt,
+            updatedAt: Date()
+        )
+        approvedProfilesByFaceProfileId[faceProfileId] = updatedProfile
+        try? saveStoredLiveProfiles()
     }
 
     @discardableResult
@@ -301,6 +466,27 @@ final class MockMemoryBridge: ObservableObject, MemoryBridge {
         }
     }
 
+    private func loadStoredLiveProfiles() {
+        guard
+            let indexURL = try? liveProfileIndexURL(),
+            let data = try? Data(contentsOf: indexURL),
+            let storedProfiles = try? JSONDecoder().decode([StoredLivePersonProfile].self, from: data)
+        else {
+            return
+        }
+
+        enrolledLiveProfiles = storedProfiles.filter { storedProfile in
+            !storedProfile.embedding.isEmpty && storedProfile.embedding.allSatisfy(\.isFinite)
+        }
+
+        for storedProfile in enrolledLiveProfiles {
+            let faceProfileId = storedProfile.profile.faceProfileId
+            approvedFaceProfileIds.insert(faceProfileId)
+            approvedProfilesByFaceProfileId[faceProfileId] = storedProfile.profile
+            embeddingsByFaceProfileId[faceProfileId] = storedProfile.embedding
+        }
+    }
+
     private func saveStoredPhotoProfiles() throws {
         let indexURL = try profileIndexURL()
         let encoder = JSONEncoder()
@@ -314,8 +500,25 @@ final class MockMemoryBridge: ObservableObject, MemoryBridge {
         }
     }
 
+    private func saveStoredLiveProfiles() throws {
+        let indexURL = try liveProfileIndexURL()
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+
+        do {
+            let data = try encoder.encode(enrolledLiveProfiles)
+            try data.write(to: indexURL, options: [.atomic])
+        } catch {
+            throw ProfilePhotoStorageError.cannotEncodeProfileIndex
+        }
+    }
+
     private func profileIndexURL() throws -> URL {
         try profilePhotoDirectoryURL().appendingPathComponent("profiles.json")
+    }
+
+    private func liveProfileIndexURL() throws -> URL {
+        try liveProfileDirectoryURL().appendingPathComponent("profiles.json")
     }
 
     private func profilePhotoDirectoryURL() throws -> URL {
@@ -326,5 +529,78 @@ final class MockMemoryBridge: ObservableObject, MemoryBridge {
         let directoryURL = documentsDirectory.appendingPathComponent("ProfilePhotos", isDirectory: true)
         try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
         return directoryURL
+    }
+
+    private func liveProfileDirectoryURL() throws -> URL {
+        guard let documentsDirectory = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else {
+            throw ProfilePhotoStorageError.cannotFindDocumentsDirectory
+        }
+
+        let directoryURL = documentsDirectory.appendingPathComponent("LiveProfiles", isDirectory: true)
+        try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+        return directoryURL
+    }
+
+    private func average(_ embeddings: [[Float]]) -> [Float] {
+        guard let first = embeddings.first else { return [] }
+        var result = [Float](repeating: 0, count: first.count)
+        var count: Float = 0
+
+        for embedding in embeddings where embedding.count == result.count {
+            for index in result.indices {
+                result[index] += embedding[index]
+            }
+            count += 1
+        }
+
+        guard count > 0 else { return [] }
+        return result.map { $0 / count }
+    }
+
+    private func transcriptEvidenceEntries(from transcript: String) -> [String] {
+        let entries = transcript
+            .components(separatedBy: CharacterSet(charactersIn: ".!?\n"))
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { $0.count >= 3 }
+
+        return uniqueTranscriptEvidence(entries).isEmpty
+            ? (transcript.isEmpty ? [] : [transcript])
+            : uniqueTranscriptEvidence(entries)
+    }
+
+    private func uniqueTranscriptEvidence(_ entries: [String]) -> [String] {
+        var seen: Set<String> = []
+        var uniqueEntries: [String] = []
+
+        for entry in entries {
+            let cleanEntry = entry.trimmingCharacters(in: .whitespacesAndNewlines)
+            let key = cleanEntry.lowercased()
+            guard !cleanEntry.isEmpty, !seen.contains(key) else { continue }
+            seen.insert(key)
+            uniqueEntries.append(cleanEntry)
+        }
+
+        return Array(uniqueEntries.suffix(6))
+    }
+
+    private func memoryCue(for name: String, transcriptEvidence: [String]) -> String {
+        guard let firstEvidence = transcriptEvidence.last, !firstEvidence.isEmpty else {
+            return "This is \(name)."
+        }
+
+        return "This is \(name). They introduced themselves by saying: \"\(firstEvidence)\""
+    }
+
+    private func detailLines(faceSampleCount: Int, transcriptEvidence: [String]) -> [String] {
+        var lines = [
+            "Live speech profile",
+            "\(faceSampleCount) face sample(s)"
+        ]
+
+        if let latestEvidence = transcriptEvidence.last {
+            lines.append("\"\(latestEvidence)\"")
+        }
+
+        return lines
     }
 }

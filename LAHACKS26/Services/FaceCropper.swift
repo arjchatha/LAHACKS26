@@ -31,15 +31,21 @@ final class FaceCropper {
 
     private let ciContext = CIContext()
 
+    func image(from pixelBuffer: CVPixelBuffer) throws -> CGImage {
+        let image = CIImage(cvPixelBuffer: pixelBuffer)
+        guard let cgImage = ciContext.createCGImage(image, from: image.extent) else {
+            throw FaceCropperError.couldNotCreateFaceImage
+        }
+
+        return cgImage
+    }
+
     func croppedFaceImages(
         from pixelBuffer: CVPixelBuffer,
         faceRect: CGRect,
         paddingScales: [CGFloat] = Constants.defaultPaddingScales
     ) throws -> [CGImage] {
-        let image = CIImage(cvPixelBuffer: pixelBuffer)
-        guard let cgImage = ciContext.createCGImage(image, from: image.extent) else {
-            throw FaceCropperError.couldNotCreateFaceImage
-        }
+        let cgImage = try image(from: pixelBuffer)
 
         return try croppedFaceImages(
             from: cgImage,

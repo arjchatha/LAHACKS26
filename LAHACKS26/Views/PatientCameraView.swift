@@ -29,22 +29,23 @@ struct PatientCameraView: View {
                     title: viewModel.focusedPersonTitle ?? "Unknown person",
                     description: viewModel.detectedPersonDescription ?? "Unknown person.",
                     detailLines: viewModel.detectedPersonDetailLines,
-                    onDescriptionTap: viewModel.focusNextPerson
+                    onDescriptionTap: {}
                 )
                     .animation(.smooth(duration: 0.16), value: viewModel.detectionResult.boundingBox)
                     .ignoresSafeArea(.all)
-
-                LiveIdentityControls(
-                    focusedPersonDisplayIndex: viewModel.focusedPersonDisplayIndex,
-                    visiblePersonCount: viewModel.visiblePersonCount,
-                    identityChoices: viewModel.identityChoices,
-                    onPrevious: viewModel.focusPreviousPerson,
-                    onNext: viewModel.focusNextPerson,
-                    onAssign: viewModel.assignFocusedPerson(to:),
-                    onUnknown: viewModel.markFocusedPersonUnknown,
-                    onAuto: viewModel.clearFocusedPersonIdentityOverride
-                )
             }
+
+            LiveFeedStatusView(
+                statusText: viewModel.liveStatusText,
+                transcript: viewModel.heardSpeechText,
+                isListening: viewModel.isListeningForSpeech,
+                activeEnrollmentName: viewModel.activeEnrollmentName,
+                activeEnrollmentProgress: viewModel.activeEnrollmentProgress,
+                activeEnrollmentTarget: viewModel.activeEnrollmentTarget
+            )
+            .padding(.horizontal, 18)
+            .padding(.bottom, 22)
+            .frame(maxHeight: .infinity, alignment: .bottom)
 
             if let cameraMessage = viewModel.cameraMessage {
                 CameraMessageView(message: cameraMessage)
@@ -65,80 +66,60 @@ struct PatientCameraView: View {
     }
 }
 
-private struct LiveIdentityControls: View {
-    let focusedPersonDisplayIndex: Int
-    let visiblePersonCount: Int
-    let identityChoices: [PersonProfileDisplay]
-    let onPrevious: () -> Void
-    let onNext: () -> Void
-    let onAssign: (String) -> Void
-    let onUnknown: () -> Void
-    let onAuto: () -> Void
+private struct LiveFeedStatusView: View {
+    let statusText: String
+    let transcript: String
+    let isListening: Bool
+    let activeEnrollmentName: String?
+    let activeEnrollmentProgress: Int
+    let activeEnrollmentTarget: Int
 
     var body: some View {
-        VStack {
-            Spacer()
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 9) {
+                Image(systemName: isListening ? "waveform.circle.fill" : "waveform.circle")
+                    .symbolRenderingMode(.hierarchical)
 
-            HStack(spacing: 10) {
-                Button(action: onPrevious) {
-                    Image(systemName: "chevron.left")
-                        .frame(width: 34, height: 34)
-                }
-                .disabled(visiblePersonCount <= 1)
+                Text(primaryText)
+                    .font(.callout.weight(.semibold))
+                    .lineLimit(1)
 
-                Text(positionText)
-                    .font(.caption.weight(.semibold))
-                    .monospacedDigit()
-                    .frame(minWidth: 48)
+                Spacer(minLength: 8)
 
-                Button(action: onNext) {
-                    Image(systemName: "chevron.right")
-                        .frame(width: 34, height: 34)
-                }
-                .disabled(visiblePersonCount <= 1)
-
-                Divider()
-                    .frame(height: 24)
-                    .overlay(.white.opacity(0.28))
-
-                Menu {
-                    if identityChoices.isEmpty {
-                        Text("No saved profiles")
-                    } else {
-                        ForEach(identityChoices, id: \.faceProfileId) { profile in
-                            Button(profile.title) {
-                                onAssign(profile.faceProfileId)
-                            }
-                        }
-                    }
-
-                    Divider()
-
-                    Button("Unknown person", action: onUnknown)
-                    Button("Automatic", action: onAuto)
-                } label: {
-                    Image(systemName: "person.crop.circle.badge.questionmark")
-                        .frame(width: 34, height: 34)
+                if activeEnrollmentName != nil {
+                    Text("\(activeEnrollmentProgress)/\(activeEnrollmentTarget)")
+                        .font(.caption.weight(.bold))
+                        .monospacedDigit()
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(.white.opacity(0.16), in: Capsule())
                 }
             }
-            .buttonStyle(.plain)
-            .foregroundStyle(.white)
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
-            .background(.ultraThinMaterial, in: Capsule())
-            .overlay {
-                Capsule()
-                    .stroke(.white.opacity(0.18), lineWidth: 1)
+
+            if !transcript.isEmpty {
+                Text(transcript)
+                    .font(.caption)
+                    .lineLimit(2)
+                    .foregroundStyle(.white.opacity(0.82))
             }
-            .shadow(color: .black.opacity(0.28), radius: 18, y: 8)
-            .padding(.bottom, 28)
         }
-        .padding(.horizontal, 18)
+        .foregroundStyle(.white)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 12)
+        .background(.black.opacity(0.58), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .stroke(.white.opacity(0.16), lineWidth: 1)
+        }
+        .shadow(color: .black.opacity(0.24), radius: 16, y: 8)
     }
 
-    private var positionText: String {
-        guard visiblePersonCount > 0 else { return "0/0" }
-        return "\(focusedPersonDisplayIndex)/\(visiblePersonCount)"
+    private var primaryText: String {
+        if let activeEnrollmentName {
+            return "Learning \(activeEnrollmentName)"
+        }
+
+        return statusText
     }
 }
 

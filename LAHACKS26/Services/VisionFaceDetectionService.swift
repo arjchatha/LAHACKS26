@@ -17,7 +17,7 @@ actor AppleVisionFaceDetectionService {
         static let maximumFaceArea: CGFloat = 0.85
         static let minimumAspectRatio: CGFloat = 0.35
         static let maximumAspectRatio: CGFloat = 2.6
-        static let maximumTrackedFaces = 6
+        static let maximumTrackedFaces = 1
     }
 
     private let sequenceHandler = VNSequenceRequestHandler()
