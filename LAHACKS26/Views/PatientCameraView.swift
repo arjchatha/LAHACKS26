@@ -33,6 +33,17 @@ struct PatientCameraView: View {
                 )
                     .animation(.smooth(duration: 0.16), value: viewModel.detectionResult.boundingBox)
                     .ignoresSafeArea(.all)
+
+                LiveIdentityControls(
+                    focusedPersonDisplayIndex: viewModel.focusedPersonDisplayIndex,
+                    visiblePersonCount: viewModel.visiblePersonCount,
+                    identityChoices: viewModel.identityChoices,
+                    onPrevious: viewModel.focusPreviousPerson,
+                    onNext: viewModel.focusNextPerson,
+                    onAssign: viewModel.assignFocusedPerson(to:),
+                    onUnknown: viewModel.markFocusedPersonUnknown,
+                    onAuto: viewModel.clearFocusedPersonIdentityOverride
+                )
             }
 
             if let cameraMessage = viewModel.cameraMessage {
@@ -51,6 +62,83 @@ struct PatientCameraView: View {
         .onDisappear {
             viewModel.stop()
         }
+    }
+}
+
+private struct LiveIdentityControls: View {
+    let focusedPersonDisplayIndex: Int
+    let visiblePersonCount: Int
+    let identityChoices: [PersonProfileDisplay]
+    let onPrevious: () -> Void
+    let onNext: () -> Void
+    let onAssign: (String) -> Void
+    let onUnknown: () -> Void
+    let onAuto: () -> Void
+
+    var body: some View {
+        VStack {
+            Spacer()
+
+            HStack(spacing: 10) {
+                Button(action: onPrevious) {
+                    Image(systemName: "chevron.left")
+                        .frame(width: 34, height: 34)
+                }
+                .disabled(visiblePersonCount <= 1)
+
+                Text(positionText)
+                    .font(.caption.weight(.semibold))
+                    .monospacedDigit()
+                    .frame(minWidth: 48)
+
+                Button(action: onNext) {
+                    Image(systemName: "chevron.right")
+                        .frame(width: 34, height: 34)
+                }
+                .disabled(visiblePersonCount <= 1)
+
+                Divider()
+                    .frame(height: 24)
+                    .overlay(.white.opacity(0.28))
+
+                Menu {
+                    if identityChoices.isEmpty {
+                        Text("No saved profiles")
+                    } else {
+                        ForEach(identityChoices, id: \.faceProfileId) { profile in
+                            Button(profile.title) {
+                                onAssign(profile.faceProfileId)
+                            }
+                        }
+                    }
+
+                    Divider()
+
+                    Button("Unknown person", action: onUnknown)
+                    Button("Automatic", action: onAuto)
+                } label: {
+                    Image(systemName: "person.crop.circle.badge.questionmark")
+                        .frame(width: 34, height: 34)
+                }
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.white)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(.ultraThinMaterial, in: Capsule())
+            .overlay {
+                Capsule()
+                    .stroke(.white.opacity(0.18), lineWidth: 1)
+            }
+            .shadow(color: .black.opacity(0.28), radius: 18, y: 8)
+            .padding(.bottom, 28)
+        }
+        .padding(.horizontal, 18)
+    }
+
+    private var positionText: String {
+        guard visiblePersonCount > 0 else { return "0/0" }
+        return "\(focusedPersonDisplayIndex)/\(visiblePersonCount)"
     }
 }
 

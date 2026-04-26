@@ -25,9 +25,9 @@ struct PersonProfileDisplay: Codable, Equatable {
     }
 }
 
-struct StoredPersonVideoProfile: Codable, Identifiable, Equatable {
+struct StoredPersonPhotoProfile: Codable, Identifiable, Equatable {
     let profile: PersonProfileDisplay
-    let videoURL: URL
+    let photoURLs: [URL]
     let embedding: [Float]
     let createdAt: Date
 

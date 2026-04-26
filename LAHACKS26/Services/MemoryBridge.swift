@@ -8,26 +8,31 @@
 import Combine
 import CoreVideo
 import Foundation
+import UIKit
 
 protocol MemoryBridge: AnyObject {
     func startPersonEnrollmentSession() -> String
     func attachEnrollmentFaceProfile(sessionId: String, faceProfileId: String, confidence: Double)
     func recognizeApprovedPerson(faceProfileId: String) -> String
     func profileDisplay(for faceProfileId: String) -> PersonProfileDisplayResult
+    func approvedProfileDisplays() -> [PersonProfileDisplay]
     func recognizedFaceProfileId(for detection: FaceDetectionResult, in pixelBuffer: CVPixelBuffer) -> String?
     func approvePersonEnrollment(personId: String, caregiverName: String)
 }
 
-enum ProfileVideoStorageError: LocalizedError {
+enum ProfilePhotoStorageError: LocalizedError {
     case cannotFindDocumentsDirectory
     case cannotEncodeProfileIndex
+    case invalidEmbeddingData
 
     var errorDescription: String? {
         switch self {
         case .cannotFindDocumentsDirectory:
-            "The app could not open local profile video storage."
+            "The app could not open local profile photo storage."
         case .cannotEncodeProfileIndex:
             "The app could not save the local profile index."
+        case .invalidEmbeddingData:
+            "The face embedding data was invalid. Try capturing the profile again in steady lighting."
         }
     }
 }
@@ -49,7 +54,7 @@ final class MockMemoryBridge: ObservableObject, MemoryBridge {
         DemoPerson.rahulFaceProfileId
     ]
     private var enrollmentFaceProfilesBySessionId: [String: String] = [:]
-    @Published private(set) var enrolledVideoProfiles: [StoredPersonVideoProfile] = []
+    @Published private(set) var enrolledPhotoProfiles: [StoredPersonPhotoProfile] = []
 
     private let faceRecognitionService = try? FaceRecognitionService()
     private var embeddingsByFaceProfileId: [String: [Float]] = [:]
@@ -93,7 +98,7 @@ final class MockMemoryBridge: ObservableObject, MemoryBridge {
     ]
 
     init() {
-        loadStoredVideoProfiles()
+        loadStoredPhotoProfiles()
     }
 
     func startPersonEnrollmentSession() -> String {
@@ -128,6 +133,14 @@ final class MockMemoryBridge: ObservableObject, MemoryBridge {
         return .approved(profile)
     }
 
+    func approvedProfileDisplays() -> [PersonProfileDisplay] {
+        approvedFaceProfileIds
+            .compactMap { approvedProfilesByFaceProfileId[$0] }
+            .sorted { lhs, rhs in
+                lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
+            }
+    }
+
     func recognizedFaceProfileId(for detection: FaceDetectionResult, in pixelBuffer: CVPixelBuffer) -> String? {
         guard detection.hasFace, detection.confidence >= 0.28 else { return nil }
 
@@ -151,12 +164,12 @@ final class MockMemoryBridge: ObservableObject, MemoryBridge {
     }
 
     @discardableResult
-    func enrollPersonFromVideo(
+    func enrollPersonFromPhotos(
         name: String,
         relationship: String,
         memoryCue: String,
         detailLines: [String],
-        sourceVideoURL: URL
+        sourceImages: [UIImage]
     ) throws -> PersonProfileDisplay {
         let cleanName = name.trimmingCharacters(in: .whitespacesAndNewlines)
         let cleanRelationship = relationship.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -166,53 +179,67 @@ final class MockMemoryBridge: ObservableObject, MemoryBridge {
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
 
-        let personId = "person-video-\(UUID().uuidString.prefix(8))"
-        let faceProfileId = "face-video-\(UUID().uuidString.prefix(8))"
-        let storedVideoURL = try storeProfileVideo(sourceURL: sourceVideoURL, personId: personId)
+        let personId = "person-photo-\(UUID().uuidString.prefix(8))"
+        let faceProfileId = "face-photo-\(UUID().uuidString.prefix(8))"
+        let storedPhotoURLs = try storeProfilePhotos(sourceImages: sourceImages, personId: personId)
         guard let faceRecognitionService else {
             throw FaceRecognitionError.embeddingModelUnavailable("The face embedding model is not available.")
         }
-        let embedding = try faceRecognitionService.enrollmentEmbedding(fromVideoAt: storedVideoURL)
+
+        let embedding = try faceRecognitionService.enrollmentEmbedding(fromImages: sourceImages)
+        guard !embedding.isEmpty, embedding.allSatisfy(\.isFinite) else {
+            try? removeStoredProfilePhotos(at: storedPhotoURLs)
+            throw ProfilePhotoStorageError.invalidEmbeddingData
+        }
         let profile = PersonProfileDisplay(
             personId: personId,
             faceProfileId: faceProfileId,
             name: cleanName,
             relationship: cleanRelationship,
             memoryCue: cleanMemoryCue,
-            detailLines: cleanDetailLines.isEmpty ? ["Video profile", "Caregiver approved"] : cleanDetailLines,
+            detailLines: cleanDetailLines.isEmpty ? ["Photo profile", "Caregiver approved"] : cleanDetailLines,
             caregiverApproved: true
         )
 
         approvedFaceProfileIds.insert(faceProfileId)
         approvedProfilesByFaceProfileId[faceProfileId] = profile
         embeddingsByFaceProfileId[faceProfileId] = embedding
-        enrolledVideoProfiles.append(
-            StoredPersonVideoProfile(
+        enrolledPhotoProfiles.append(
+            StoredPersonPhotoProfile(
                 profile: profile,
-                videoURL: storedVideoURL,
+                photoURLs: storedPhotoURLs,
                 embedding: embedding,
                 createdAt: Date()
             )
         )
-        try saveStoredVideoProfiles()
+        do {
+            try saveStoredPhotoProfiles()
+        } catch {
+            approvedFaceProfileIds.remove(faceProfileId)
+            approvedProfilesByFaceProfileId.removeValue(forKey: faceProfileId)
+            embeddingsByFaceProfileId.removeValue(forKey: faceProfileId)
+            enrolledPhotoProfiles.removeAll { $0.profile.faceProfileId == faceProfileId }
+            try? removeStoredProfilePhotos(at: storedPhotoURLs)
+            throw error
+        }
 
         return profile
     }
 
-    func deleteVideoProfile(personId: String) {
-        guard let index = enrolledVideoProfiles.firstIndex(where: { $0.profile.personId == personId }) else {
+    func deletePhotoProfile(personId: String) {
+        guard let index = enrolledPhotoProfiles.firstIndex(where: { $0.profile.personId == personId }) else {
             return
         }
 
-        let storedProfile = enrolledVideoProfiles.remove(at: index)
+        let storedProfile = enrolledPhotoProfiles.remove(at: index)
         approvedFaceProfileIds.remove(storedProfile.profile.faceProfileId)
         approvedProfilesByFaceProfileId.removeValue(forKey: storedProfile.profile.faceProfileId)
         embeddingsByFaceProfileId.removeValue(forKey: storedProfile.profile.faceProfileId)
 
-        if FileManager.default.fileExists(atPath: storedProfile.videoURL.path) {
-            try? FileManager.default.removeItem(at: storedProfile.videoURL)
+        for photoURL in storedProfile.photoURLs where FileManager.default.fileExists(atPath: photoURL.path) {
+            try? FileManager.default.removeItem(at: photoURL)
         }
-        try? saveStoredVideoProfiles()
+        try? saveStoredPhotoProfiles()
     }
 
     func approvePersonEnrollment(personId: String, caregiverName: String) {
@@ -220,33 +247,53 @@ final class MockMemoryBridge: ObservableObject, MemoryBridge {
         approvedFaceProfileIds.insert(DemoPerson.mayaFaceProfileId)
     }
 
-    private func storeProfileVideo(sourceURL: URL, personId: String) throws -> URL {
-        let directoryURL = try profileVideoDirectoryURL()
-        try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+    private func storeProfilePhotos(sourceImages: [UIImage], personId: String) throws -> [URL] {
+        let directoryURL = try profilePhotoDirectoryURL()
+        let profileDirectoryURL = directoryURL.appendingPathComponent(personId, isDirectory: true)
+        try FileManager.default.createDirectory(at: profileDirectoryURL, withIntermediateDirectories: true)
 
-        let destinationURL = directoryURL.appendingPathComponent("\(personId).mov")
-        if FileManager.default.fileExists(atPath: destinationURL.path) {
-            try FileManager.default.removeItem(at: destinationURL)
+        if let existingFiles = try? FileManager.default.contentsOfDirectory(
+            at: profileDirectoryURL,
+            includingPropertiesForKeys: nil
+        ) {
+            for fileURL in existingFiles {
+                try? FileManager.default.removeItem(at: fileURL)
+            }
         }
-        try FileManager.default.copyItem(at: sourceURL, to: destinationURL)
 
-        return destinationURL
+        var storedURLs: [URL] = []
+
+        for (index, image) in sourceImages.enumerated() {
+            guard let imageData = image.jpegData(compressionQuality: 0.92) else { continue }
+            let destinationURL = profileDirectoryURL.appendingPathComponent("photo-\(index + 1).jpg")
+            try imageData.write(to: destinationURL, options: [.atomic])
+            storedURLs.append(destinationURL)
+        }
+
+        return storedURLs
     }
 
-    private func loadStoredVideoProfiles() {
+    private func removeStoredProfilePhotos(at photoURLs: [URL]) throws {
+        for photoURL in photoURLs where FileManager.default.fileExists(atPath: photoURL.path) {
+            try FileManager.default.removeItem(at: photoURL)
+        }
+    }
+
+    private func loadStoredPhotoProfiles() {
         guard
             let indexURL = try? profileIndexURL(),
             let data = try? Data(contentsOf: indexURL),
-            let storedProfiles = try? JSONDecoder().decode([StoredPersonVideoProfile].self, from: data)
+            let storedProfiles = try? JSONDecoder().decode([StoredPersonPhotoProfile].self, from: data)
         else {
             return
         }
 
-        enrolledVideoProfiles = storedProfiles.filter { storedProfile in
-            FileManager.default.fileExists(atPath: storedProfile.videoURL.path)
+        enrolledPhotoProfiles = storedProfiles.filter { storedProfile in
+            !storedProfile.photoURLs.isEmpty
+                && storedProfile.photoURLs.allSatisfy { FileManager.default.fileExists(atPath: $0.path) }
         }
 
-        for storedProfile in enrolledVideoProfiles {
+        for storedProfile in enrolledPhotoProfiles {
             let faceProfileId = storedProfile.profile.faceProfileId
             approvedFaceProfileIds.insert(faceProfileId)
             approvedProfilesByFaceProfileId[faceProfileId] = storedProfile.profile
@@ -254,29 +301,29 @@ final class MockMemoryBridge: ObservableObject, MemoryBridge {
         }
     }
 
-    private func saveStoredVideoProfiles() throws {
+    private func saveStoredPhotoProfiles() throws {
         let indexURL = try profileIndexURL()
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
 
         do {
-            let data = try encoder.encode(enrolledVideoProfiles)
+            let data = try encoder.encode(enrolledPhotoProfiles)
             try data.write(to: indexURL, options: [.atomic])
         } catch {
-            throw ProfileVideoStorageError.cannotEncodeProfileIndex
+            throw ProfilePhotoStorageError.cannotEncodeProfileIndex
         }
     }
 
     private func profileIndexURL() throws -> URL {
-        try profileVideoDirectoryURL().appendingPathComponent("profiles.json")
+        try profilePhotoDirectoryURL().appendingPathComponent("profiles.json")
     }
 
-    private func profileVideoDirectoryURL() throws -> URL {
+    private func profilePhotoDirectoryURL() throws -> URL {
         guard let documentsDirectory = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else {
-            throw ProfileVideoStorageError.cannotFindDocumentsDirectory
+            throw ProfilePhotoStorageError.cannotFindDocumentsDirectory
         }
 
-        let directoryURL = documentsDirectory.appendingPathComponent("ProfileVideos", isDirectory: true)
+        let directoryURL = documentsDirectory.appendingPathComponent("ProfilePhotos", isDirectory: true)
         try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
         return directoryURL
     }

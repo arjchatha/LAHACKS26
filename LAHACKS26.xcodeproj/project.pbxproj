@@ -6,6 +6,10 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		9C0A2B001234567800000002 /* ZeticMLange in Frameworks */ = {isa = PBXBuildFile; productRef = 9C0A2B001234567800000001 /* ZeticMLange */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXContainerItemProxy section */
 		676A38F92F9C8A4500CA969A /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
@@ -52,6 +56,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				9C0A2B001234567800000002 /* ZeticMLange in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -112,6 +117,7 @@
 			);
 			name = LAHACKS26;
 			packageProductDependencies = (
+				9C0A2B001234567800000001 /* ZeticMLange */,
 			);
 			productName = LAHACKS26;
 			productReference = 676A38EB2F9C8A4400CA969A /* LAHACKS26.app */;
@@ -195,6 +201,9 @@
 			);
 			mainGroup = 676A38E22F9C8A4400CA969A;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				9C0A2B001234567800000000 /* XCRemoteSwiftPackageReference "ZeticMLangeiOS" */,
+			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 676A38EC2F9C8A4400CA969A /* Products */;
 			projectDirPath = "";
@@ -406,8 +415,8 @@
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_NSCameraUsageDescription = "This app uses the camera to recognize familiar faces and show supportive memory cues during conversations.";
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
-				INFOPLIST_KEY_NSMicrophoneUsageDescription = "This app records short local profile videos for caregiver-approved face profiles.";
-				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "This app lets caregivers choose local videos to create approved face profiles.";
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "This app keeps audio access available for future caregiver capture workflows.";
+				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "This app lets caregivers choose local photos to create approved face profiles.";
 				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -447,8 +456,8 @@
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_NSCameraUsageDescription = "This app uses the camera to recognize familiar faces and show supportive memory cues during conversations.";
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
-				INFOPLIST_KEY_NSMicrophoneUsageDescription = "This app records short local profile videos for caregiver-approved face profiles.";
-				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "This app lets caregivers choose local videos to create approved face profiles.";
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "This app keeps audio access available for future caregiver capture workflows.";
+				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "This app lets caregivers choose local photos to create approved face profiles.";
 				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -591,6 +600,25 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		9C0A2B001234567800000000 /* XCRemoteSwiftPackageReference "ZeticMLangeiOS" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/zetic-ai/ZeticMLangeiOS.git";
+			requirement = {
+				kind = exactVersion;
+				version = 1.6.0;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		9C0A2B001234567800000001 /* ZeticMLange */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 9C0A2B001234567800000000 /* XCRemoteSwiftPackageReference "ZeticMLangeiOS" */;
+			productName = ZeticMLange;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = 676A38E32F9C8A4400CA969A /* Project object */;
 }

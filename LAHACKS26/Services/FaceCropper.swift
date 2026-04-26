@@ -9,7 +9,6 @@ import CoreGraphics
 import CoreImage
 import CoreVideo
 import Foundation
-import UIKit
 
 enum FaceCropperError: LocalizedError {
     case couldNotCreateFaceImage
@@ -27,42 +26,57 @@ enum FaceCropperError: LocalizedError {
 
 final class FaceCropper {
     private enum Constants {
-        static let sideLength = 224
-        static let paddingScale: CGFloat = 0.24
-        static let channelMeans: [Float] = [
-            129.186279296875,
-            104.76238250732422,
-            93.59396362304688
-        ]
+        static let defaultPaddingScales: [CGFloat] = [0.10, 0.20, 0.30]
     }
 
     private let ciContext = CIContext()
 
-    func preprocessedTensor(from pixelBuffer: CVPixelBuffer, faceRect: CGRect) throws -> [Float] {
+    func croppedFaceImages(
+        from pixelBuffer: CVPixelBuffer,
+        faceRect: CGRect,
+        paddingScales: [CGFloat] = Constants.defaultPaddingScales
+    ) throws -> [CGImage] {
         let image = CIImage(cvPixelBuffer: pixelBuffer)
         guard let cgImage = ciContext.createCGImage(image, from: image.extent) else {
             throw FaceCropperError.couldNotCreateFaceImage
         }
 
-        return try preprocessedTensor(from: cgImage, topLeftNormalizedFaceRect: faceRect)
+        return try croppedFaceImages(
+            from: cgImage,
+            topLeftNormalizedFaceRect: faceRect,
+            paddingScales: paddingScales
+        )
     }
 
-    func preprocessedTensor(from cgImage: CGImage, topLeftNormalizedFaceRect faceRect: CGRect) throws -> [Float] {
+    func croppedFaceImages(
+        from cgImage: CGImage,
+        topLeftNormalizedFaceRect faceRect: CGRect,
+        paddingScales: [CGFloat] = Constants.defaultPaddingScales
+    ) throws -> [CGImage] {
         let sourceSize = CGSize(width: cgImage.width, height: cgImage.height)
-        let cropRect = paddedSquareRect(for: faceRect, sourceSize: sourceSize)
+        let validScales = paddingScales.isEmpty ? Constants.defaultPaddingScales : paddingScales
+        let croppedImages = validScales.compactMap { paddingScale -> CGImage? in
+            let cropRect = paddedSquareRect(
+                for: faceRect,
+                sourceSize: sourceSize,
+                paddingScale: paddingScale
+            )
+            guard cropRect.width > 1, cropRect.height > 1 else { return nil }
+            return cgImage.cropping(to: cropRect.integral)
+        }
 
-        guard
-            cropRect.width > 1,
-            cropRect.height > 1,
-            let croppedImage = cgImage.cropping(to: cropRect)
-        else {
+        guard !croppedImages.isEmpty else {
             throw FaceCropperError.invalidFaceRect
         }
 
-        return try rgbTensor(from: croppedImage)
+        return croppedImages
     }
 
-    private func paddedSquareRect(for faceRect: CGRect, sourceSize: CGSize) -> CGRect {
+    private func paddedSquareRect(
+        for faceRect: CGRect,
+        sourceSize: CGSize,
+        paddingScale: CGFloat
+    ) -> CGRect {
         let pixelRect = CGRect(
             x: faceRect.minX * sourceSize.width,
             y: faceRect.minY * sourceSize.height,
@@ -70,7 +84,7 @@ final class FaceCropper {
             height: faceRect.height * sourceSize.height
         )
 
-        let side = max(pixelRect.width, pixelRect.height) * (1 + Constants.paddingScale)
+        let side = max(pixelRect.width, pixelRect.height) * (1 + (paddingScale * 2))
         let rect = CGRect(
             x: pixelRect.midX - side / 2,
             y: pixelRect.midY - side / 2,
@@ -79,40 +93,6 @@ final class FaceCropper {
         )
 
         return rect.clamped(to: CGRect(origin: .zero, size: sourceSize))
-    }
-
-    private func rgbTensor(from image: CGImage) throws -> [Float] {
-        let sideLength = Constants.sideLength
-        let pixelCount = sideLength * sideLength
-        let bytesPerPixel = 4
-        let bytesPerRow = sideLength * bytesPerPixel
-        var pixels = [UInt8](repeating: 0, count: pixelCount * bytesPerPixel)
-
-        guard let context = CGContext(
-            data: &pixels,
-            width: sideLength,
-            height: sideLength,
-            bitsPerComponent: 8,
-            bytesPerRow: bytesPerRow,
-            space: CGColorSpaceCreateDeviceRGB(),
-            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue
-        ) else {
-            throw FaceCropperError.couldNotCreateFaceImage
-        }
-
-        context.interpolationQuality = .high
-        context.draw(image, in: CGRect(x: 0, y: 0, width: sideLength, height: sideLength))
-
-        var tensor = [Float](repeating: 0, count: 3 * pixelCount)
-
-        for pixelIndex in 0..<pixelCount {
-            let byteIndex = pixelIndex * bytesPerPixel
-            tensor[pixelIndex] = Float(pixels[byteIndex]) - Constants.channelMeans[0]
-            tensor[pixelCount + pixelIndex] = Float(pixels[byteIndex + 1]) - Constants.channelMeans[1]
-            tensor[(2 * pixelCount) + pixelIndex] = Float(pixels[byteIndex + 2]) - Constants.channelMeans[2]
-        }
-
-        return tensor
     }
 }
 
