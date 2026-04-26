@@ -54,6 +54,15 @@ final class AppleSpeechTranscriptionService: NSObject, ObservableObject, SpeechT
 
             let request = SFSpeechAudioBufferRecognitionRequest()
             request.shouldReportPartialResults = true
+            request.taskHint = .dictation
+            if #available(iOS 16.0, *) {
+                request.addsPunctuation = true
+            }
+            request.contextualStrings = [
+                "friend", "neighbor", "family", "caregiver", "doctor", "nurse",
+                "funeral", "hospital", "pharmacy", "store", "appointment",
+                "birthday", "wedding", "coffee", "mail"
+            ]
             if speechRecognizer?.supportsOnDeviceRecognition == true {
                 request.requiresOnDeviceRecognition = true
             }
@@ -62,7 +71,7 @@ final class AppleSpeechTranscriptionService: NSObject, ObservableObject, SpeechT
             let inputNode = audioEngine.inputNode
             let recordingFormat = inputNode.outputFormat(forBus: 0)
             inputNode.removeTap(onBus: 0)
-            inputNode.installTap(onBus: 0, bufferSize: 1_024, format: recordingFormat) { [weak self] buffer, _ in
+            inputNode.installTap(onBus: 0, bufferSize: 512, format: recordingFormat) { [weak self] buffer, _ in
                 Task { @MainActor in
                     self?.recognitionRequest?.append(buffer)
                 }

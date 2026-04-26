@@ -22,7 +22,10 @@ final class PatientCameraViewModel: ObservableObject {
     private var lastFrameProcessDate = Date.distantPast
     private var faceMissStreak = 0
     private var smoothedBoundingBox: CGRect?
+    private var lastVisibleFaceProfileId: String?
+    private var lastVisibleFaceProfileDate = Date.distantPast
     private let minimumFrameInterval: TimeInterval = 0.05
+    private let faceProfileHoldDuration: TimeInterval = 2.5
 
     init() {
         cameraManager.onFrame = { [weak self] pixelBuffer, isUsingFrontCamera in
@@ -81,7 +84,8 @@ final class PatientCameraViewModel: ObservableObject {
             let smoothedResult = FaceDetectionResult.detected(
                 confidence: result.confidence,
                 boundingBox: smoothedRect(toward: result.boundingBox),
-                sourceImageSize: result.sourceImageSize
+                sourceImageSize: result.sourceImageSize,
+                faceProfileId: displayedFaceProfileId(for: result)
             )
 
             withAnimation(.smooth(duration: 0.16)) {
@@ -126,6 +130,23 @@ final class PatientCameraViewModel: ObservableObject {
 
     private func applyDetection(_ result: FaceDetectionResult) {
         detectionResult = result
+    }
+
+    private func displayedFaceProfileId(for result: FaceDetectionResult) -> String? {
+        if let faceProfileId = result.faceProfileId {
+            lastVisibleFaceProfileId = faceProfileId
+            lastVisibleFaceProfileDate = Date()
+            return faceProfileId
+        }
+
+        guard
+            result.hasFace,
+            Date().timeIntervalSince(lastVisibleFaceProfileDate) <= faceProfileHoldDuration
+        else {
+            return nil
+        }
+
+        return lastVisibleFaceProfileId
     }
 }
 

@@ -17,6 +17,7 @@ struct PatientCameraView: View {
     @State private var faceGateTask: Task<Void, Never>?
     @State private var stopTranscriptionTask: Task<Void, Never>?
     @State private var transcriptionActive = false
+    @State private var activeTranscriptionFaceProfileId: String?
 
     init(memoryBridge: MockMemoryBridge) {
         self.memoryBridge = memoryBridge
@@ -24,6 +25,10 @@ struct PatientCameraView: View {
     }
 
     var body: some View {
+        let profileDisplay = viewModel.detectionResult.faceProfileId.map {
+            memoryBridge.profileDisplay(for: $0)
+        } ?? .unknown("I see someone nearby, but I do not know who they are yet.")
+
         ZStack {
             Color.black
                 .ignoresSafeArea(.all)
@@ -34,7 +39,10 @@ struct PatientCameraView: View {
 
             if viewModel.detectionResult.hasFace {
                 FaceBoundingBoxOverlay(
-                    detection: viewModel.detectionResult
+                    detection: viewModel.detectionResult,
+                    title: profileDisplay.title,
+                    description: profileDisplay.description,
+                    detailLines: profileDisplay.detailLines
                 )
                     .animation(.smooth(duration: 0.16), value: viewModel.detectionResult.boundingBox)
                     .ignoresSafeArea(.all)
@@ -68,8 +76,12 @@ struct PatientCameraView: View {
             await viewModel.start()
             await speechService.requestPermissions()
         }
-        .onChange(of: viewModel.detectionResult.hasFace) { _, hasFace in
-            handleFaceBoundStateChanged(hasFace: hasFace)
+        .onChange(of: viewModel.detectionResult.hasFace) { _, _ in
+            handleFaceBoundStateChanged()
+        }
+        .onChange(of: viewModel.detectionResult.faceProfileId) { _, faceProfileId in
+            memoryCoordinator.updateActiveFaceProfileId(faceProfileId)
+            handleFaceProfileChanged(to: faceProfileId)
         }
         .onChange(of: speechService.transcript) { _, transcript in
             memoryCoordinator.submitTranscript(transcript)
@@ -90,14 +102,22 @@ struct PatientCameraView: View {
         }
     }
 
-    private func handleFaceBoundStateChanged(hasFace: Bool) {
-        if hasFace {
+    private func handleFaceBoundStateChanged() {
+        let hasStableFaceProfile = viewModel.detectionResult.hasFace && viewModel.detectionResult.faceProfileId != nil
+
+        if hasStableFaceProfile {
             faceGateTask?.cancel()
             guard !transcriptionActive else { return }
 
             faceGateTask = Task { @MainActor in
-                try? await Task.sleep(for: .milliseconds(450))
-                guard !Task.isCancelled, viewModel.detectionResult.hasFace else { return }
+                try? await Task.sleep(for: .milliseconds(120))
+                guard
+                    !Task.isCancelled,
+                    viewModel.detectionResult.hasFace,
+                    viewModel.detectionResult.faceProfileId != nil
+                else {
+                    return
+                }
 
                 startFaceBoundTranscription()
             }
@@ -114,12 +134,27 @@ struct PatientCameraView: View {
         }
     }
 
+    private func handleFaceProfileChanged(to faceProfileId: String?) {
+        guard transcriptionActive else {
+            handleFaceBoundStateChanged()
+            return
+        }
+
+        guard faceProfileId == activeTranscriptionFaceProfileId else {
+            restartFaceBoundTranscriptionForFaceChange()
+            return
+        }
+    }
+
     private func startFaceBoundTranscription() {
         guard !transcriptionActive else { return }
+        guard let faceProfileId = viewModel.detectionResult.faceProfileId else { return }
 
         stopTranscriptionTask?.cancel()
         transcriptionActive = true
+        activeTranscriptionFaceProfileId = faceProfileId
         speechService.resetTranscript()
+        memoryCoordinator.updateActiveFaceProfileId(faceProfileId)
         memoryCoordinator.beginFaceBoundConversation()
         speechService.startRecording()
     }
@@ -128,6 +163,7 @@ struct PatientCameraView: View {
         guard transcriptionActive else { return }
 
         transcriptionActive = false
+        activeTranscriptionFaceProfileId = nil
         speechService.stopRecording()
         memoryCoordinator.flushCurrentTranscript()
 
@@ -139,6 +175,22 @@ struct PatientCameraView: View {
             memoryCoordinator.flushCurrentTranscript()
             memoryCoordinator.endFaceBoundConversation()
         }
+    }
+
+    private func restartFaceBoundTranscriptionForFaceChange() {
+        faceGateTask?.cancel()
+        stopTranscriptionTask?.cancel()
+
+        if transcriptionActive {
+            transcriptionActive = false
+            activeTranscriptionFaceProfileId = nil
+            speechService.stopRecording()
+            memoryCoordinator.flushCurrentTranscript()
+            memoryCoordinator.endFaceBoundConversation()
+            speechService.resetTranscript()
+        }
+
+        handleFaceBoundStateChanged()
     }
 
     private func showSavedBanner(for event: MemoryCoordinatorEvent) {
@@ -251,6 +303,9 @@ private struct SaveBannerView: View {
 
 private struct FaceBoundingBoxOverlay: View {
     let detection: FaceDetectionResult
+    let title: String
+    let description: String
+    let detailLines: [String]
 
     var body: some View {
         GeometryReader { geometry in
@@ -262,10 +317,172 @@ private struct FaceBoundingBoxOverlay: View {
             let fittedRect = rect.insetBy(dx: insetAmount, dy: insetAmount)
 
             if !fittedRect.isNull && fittedRect.width > 0 && fittedRect.height > 0 {
-                LiquidTrackingBox()
-                    .frame(width: fittedRect.width, height: fittedRect.height)
-                    .position(x: fittedRect.midX, y: fittedRect.midY)
+                ZStack {
+                    LiquidTrackingBox()
+                        .frame(width: fittedRect.width, height: fittedRect.height)
+                        .position(x: fittedRect.midX, y: fittedRect.midY)
+
+                    PersonDescriptionCallout(
+                        faceRect: fittedRect,
+                        title: title,
+                        description: description,
+                        detailLines: detailLines,
+                        containerSize: geometry.size
+                    )
+                }
             }
+        }
+    }
+}
+
+private struct PersonDescriptionCallout: View {
+    let faceRect: CGRect
+    let title: String
+    let description: String
+    let detailLines: [String]
+    let containerSize: CGSize
+
+    private let calloutWidth: CGFloat = 232
+    private let connectorGap: CGFloat = 18
+    private let horizontalInset: CGFloat = 18
+
+    private var calloutHeight: CGFloat {
+        detailLines.isEmpty ? 78 : 124
+    }
+
+    var body: some View {
+        let placement = placementMetrics()
+
+        ZStack {
+            ConnectorLine(
+                start: placement.connectorStart,
+                end: placement.connectorEnd
+            )
+
+            PersonDescriptionBubble(
+                title: title,
+                description: description,
+                detailLines: detailLines
+            )
+                .frame(width: calloutWidth)
+                .position(placement.calloutCenter)
+        }
+    }
+
+    private func placementMetrics() -> CalloutPlacement {
+        let placeAbove = faceRect.minY > calloutHeight + connectorGap + 24
+        let calloutCenterX = faceRect.midX.clamped(
+            min: horizontalInset + (calloutWidth / 2),
+            max: containerSize.width - horizontalInset - (calloutWidth / 2)
+        )
+        let connectorTarget = CGPoint(
+            x: faceRect.midX,
+            y: placeAbove ? faceRect.minY : faceRect.maxY
+        )
+        let connectorStartY = placeAbove
+            ? connectorTarget.y - connectorGap
+            : connectorTarget.y + connectorGap
+        let calloutCenterY = placeAbove
+            ? connectorStartY - (calloutHeight / 2)
+            : connectorStartY + (calloutHeight / 2)
+        let connectorStart = CGPoint(
+            x: calloutCenterX,
+            y: connectorStartY
+        )
+
+        return CalloutPlacement(
+            calloutCenter: CGPoint(x: calloutCenterX, y: calloutCenterY),
+            connectorStart: connectorStart,
+            connectorEnd: connectorTarget
+        )
+    }
+}
+
+private struct PersonDescriptionBubble: View {
+    let title: String
+    let description: String
+    let detailLines: [String]
+
+    var body: some View {
+        let content = VStack(alignment: .leading, spacing: 6) {
+            Text(title)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.white.opacity(0.72))
+                .lineLimit(1)
+
+            Text(description)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.white)
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if !detailLines.isEmpty {
+                VStack(alignment: .leading, spacing: 3) {
+                    ForEach(detailLines.prefix(2), id: \.self) { line in
+                        Text(line)
+                            .font(.caption2.weight(.medium))
+                            .foregroundStyle(.white.opacity(0.72))
+                            .lineLimit(1)
+                    }
+                }
+                .padding(.top, 2)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 12)
+
+        Group {
+            if #available(iOS 26.0, *) {
+                content
+                    .glassEffect(.regular.tint(.white.opacity(0.08)), in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 22, style: .continuous)
+                            .stroke(.white.opacity(0.22), lineWidth: 1)
+                    }
+            } else {
+                content
+                    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 22, style: .continuous)
+                            .stroke(.white.opacity(0.18), lineWidth: 1)
+                    }
+            }
+        }
+        .shadow(color: .black.opacity(0.28), radius: 18, y: 8)
+    }
+}
+
+private struct ConnectorLine: View {
+    let start: CGPoint
+    let end: CGPoint
+
+    var body: some View {
+        ZStack {
+            Path { path in
+                path.move(to: start)
+                path.addLine(to: end)
+            }
+            .stroke(.black.opacity(0.2), style: StrokeStyle(lineWidth: 5, lineCap: .round))
+
+            Path { path in
+                path.move(to: start)
+                path.addLine(to: end)
+            }
+            .stroke(
+                LinearGradient(
+                    colors: [.white.opacity(0.92), .white.opacity(0.44)],
+                    startPoint: .top,
+                    endPoint: .bottom
+                ),
+                style: StrokeStyle(lineWidth: 2, lineCap: .round)
+            )
+
+            Circle()
+                .fill(.white.opacity(0.96))
+                .frame(width: 8, height: 8)
+                .position(end)
+                .shadow(color: .white.opacity(0.2), radius: 8)
         }
     }
 }
@@ -336,6 +553,18 @@ private struct CornerBracketOverlay: View {
                 .frame(width: 4, height: edgeLength)
         }
         .shadow(color: .white.opacity(0.18), radius: 10)
+    }
+}
+
+private struct CalloutPlacement {
+    let calloutCenter: CGPoint
+    let connectorStart: CGPoint
+    let connectorEnd: CGPoint
+}
+
+private extension CGFloat {
+    func clamped(min minimum: CGFloat, max maximum: CGFloat) -> CGFloat {
+        Swift.min(Swift.max(self, minimum), maximum)
     }
 }
 

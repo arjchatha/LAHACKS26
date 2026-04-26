@@ -13,6 +13,7 @@ struct FaceDetectionResult: Identifiable, Equatable {
     let confidence: Double
     let boundingBox: CGRect
     let sourceImageSize: CGSize?
+    let faceProfileId: String?
 
     var hasFace: Bool {
         confidence > 0 && !boundingBox.isNull && !boundingBox.isEmpty
@@ -22,20 +23,23 @@ struct FaceDetectionResult: Identifiable, Equatable {
         id: UUID(),
         confidence: 0,
         boundingBox: .null,
-        sourceImageSize: nil
+        sourceImageSize: nil,
+        faceProfileId: nil
     )
 
     nonisolated static func detected(
         id: UUID = UUID(),
         confidence: Double,
         boundingBox: CGRect,
-        sourceImageSize: CGSize? = nil
+        sourceImageSize: CGSize? = nil,
+        faceProfileId: String? = nil
     ) -> FaceDetectionResult {
         FaceDetectionResult(
             id: id,
             confidence: confidence,
             boundingBox: boundingBox,
-            sourceImageSize: sourceImageSize
+            sourceImageSize: sourceImageSize,
+            faceProfileId: faceProfileId
         )
     }
 
