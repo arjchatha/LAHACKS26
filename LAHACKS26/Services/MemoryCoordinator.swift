@@ -393,6 +393,7 @@ final class MemoryCoordinator: ObservableObject {
             extractedName: decision.extractedName,
             extractedRelationship: extractedRelationship,
             extractedHelpfulContext: extractedHelpfulContext,
+            patientPrompt: decision.patientPrompt,
             faceProfileId: faceProfileId,
             confidence: faceConfidence
         ) else {
@@ -402,7 +403,9 @@ final class MemoryCoordinator: ObservableObject {
 
         lastStoredSignature = signature
         print("MindAnchor memory saved:", memory.name)
-        _ = storeInteractionIfNeeded(decision: decision, transcript: transcript, shouldShowEvent: false)
+        if decision.memoryType != .person {
+            _ = storeInteractionIfNeeded(decision: decision, transcript: transcript, shouldShowEvent: false)
+        }
         Task { @MainActor in
             try? await Task.sleep(for: .milliseconds(350))
             latestEvent = MemoryCoordinatorEvent(
@@ -494,6 +497,7 @@ final class MemoryCoordinator: ObservableObject {
             extractedName: candidate.name,
             extractedRelationship: candidate.relationship,
             extractedHelpfulContext: candidate.helpfulContext,
+            patientPrompt: nil,
             faceProfileId: faceProfileId,
             confidence: faceConfidence
         ) else {
@@ -586,6 +590,7 @@ final class MemoryCoordinator: ObservableObject {
             extractedName: activeMemory.name,
             extractedRelationship: mergedRelationship,
             extractedHelpfulContext: mergedHelpfulContext,
+            patientPrompt: nil,
             faceProfileId: faceProfileId,
             confidence: faceConfidence
         ) else {
@@ -858,6 +863,15 @@ final class MemoryCoordinator: ObservableObject {
             return false
         }
 
+        if let helpfulContext, containsUnsafePersonContext(helpfulContext) {
+            return false
+        }
+
+        if let prompt = cleanedDecisionField(decision.patientPrompt),
+           !prompt.localizedCaseInsensitiveContains(name) {
+            return false
+        }
+
         return true
     }
 
@@ -910,9 +924,11 @@ final class MemoryCoordinator: ObservableObject {
             "patient",
             "memory",
             "interactionsummary",
+            "introduction",
             "event",
             "prototype",
-            "response"
+            "response",
+            "patientprompt"
         ].contains(value)
     }
 
@@ -933,10 +949,25 @@ final class MemoryCoordinator: ObservableObject {
             "patient",
             "memory",
             "interactionsummary",
+            "introduction",
             "event",
             "prototype",
-            "response"
+            "response",
+            "patientprompt"
         ].contains(value)
+    }
+
+    private func containsUnsafePersonContext(_ value: String) -> Bool {
+        let normalizedValue = normalized(value)
+        return [
+            "likes little kids",
+            "like little kids",
+            "bad guy",
+            "bad things",
+            "creep",
+            "dangerous",
+            "not good"
+        ].contains { normalizedValue.contains($0) }
     }
 }
 
@@ -1008,7 +1039,17 @@ private struct MemoryCapturePolicy {
         transcript: String,
         activeMemory: DemoPersonMemory?
     ) -> MemoryCapturePolicyDecision {
+        if shouldAcceptModel(modelDecision, transcript: transcript) {
+            print("MindAnchor policy: accepting local LLM decision before fallback extraction")
+            return MemoryCapturePolicyDecision(
+                action: .acceptModel,
+                finalDecision: modelDecision,
+                reason: "model decision passed policy"
+            )
+        }
+
         if let personCandidate = extractor.extractPersonProfile(from: transcript) {
+            print("MindAnchor policy: local LLM did not produce acceptable person memory; using regex person fallback")
             return MemoryCapturePolicyDecision(
                 action: .storePersonCandidate(personCandidate),
                 finalDecision: decision(for: personCandidate),
@@ -1019,18 +1060,11 @@ private struct MemoryCapturePolicy {
         }
 
         if activeMemory != nil, let contextCandidate = extractor.extractPersonContext(from: transcript) {
+            print("MindAnchor policy: local LLM did not produce acceptable context update; using regex context fallback")
             return MemoryCapturePolicyDecision(
                 action: .updateActiveMemoryWithContext(contextCandidate),
                 finalDecision: decision(for: contextCandidate, activeMemory: activeMemory),
                 reason: "policy found context for active memory"
-            )
-        }
-
-        if shouldAcceptModel(modelDecision) {
-            return MemoryCapturePolicyDecision(
-                action: .acceptModel,
-                finalDecision: modelDecision,
-                reason: "model decision passed policy"
             )
         }
 
@@ -1041,16 +1075,155 @@ private struct MemoryCapturePolicy {
         )
     }
 
-    private func shouldAcceptModel(_ decision: TranscriptAnalysisDecision) -> Bool {
+    private func shouldAcceptModel(_ decision: TranscriptAnalysisDecision, transcript: String) -> Bool {
         guard decision.shouldStore, decision.memoryType != .none else { return false }
 
         if decision.memoryType == .person {
-            return decision.extractedName != nil && decision.storageConfidence >= 0.45
+            guard decision.storageConfidence >= 0.45 else { return false }
+            guard let name = cleaned(decision.extractedName), !isGenericNamePlaceholder(normalized(name)) else {
+                print("MindAnchor policy: rejecting local LLM person memory because extractedName is missing or generic")
+                return false
+            }
+            guard transcript.localizedCaseInsensitiveContains(name) else {
+                print("MindAnchor policy: rejecting local LLM person memory because extractedName is not in transcript")
+                return false
+            }
+
+            if words(in: name).count == 1,
+               cleaned(decision.extractedRelationship) == nil,
+               cleaned(decision.extractedHelpfulContext) == nil,
+               decision.storageConfidence > 0.65 {
+                print("MindAnchor policy: rejecting local LLM person memory because single-word name has no context despite high confidence")
+                return false
+            }
+
+            if let relationship = cleaned(decision.extractedRelationship), isGenericFieldPlaceholder(normalized(relationship)) {
+                print("MindAnchor policy: rejecting local LLM person memory because relationship is generic")
+                return false
+            }
+
+            if let helpfulContext = cleaned(decision.extractedHelpfulContext), isGenericFieldPlaceholder(normalized(helpfulContext)) {
+                print("MindAnchor policy: rejecting local LLM person memory because helpfulContext is generic")
+                return false
+            }
+
+            if let helpfulContext = cleaned(decision.extractedHelpfulContext), containsUnsafePersonContext(helpfulContext) {
+                print("MindAnchor policy: rejecting local LLM person memory because helpfulContext is unsafe/noisy")
+                return false
+            }
+
+            if let evidenceQuote = cleaned(decision.evidenceQuote), containsUnsafePersonContext(evidenceQuote) {
+                print("MindAnchor policy: rejecting local LLM person memory because evidenceQuote is unsafe/noisy")
+                return false
+            }
+
+            if let summary = cleaned(decision.interactionSummary), containsUnsafePersonContext(summary) {
+                print("MindAnchor policy: rejecting local LLM person memory because summary is unsafe/noisy")
+                return false
+            }
+
+            if let prompt = cleaned(decision.patientPrompt),
+               !prompt.localizedCaseInsensitiveContains(name) {
+                print("MindAnchor policy: rejecting local LLM person memory because patientPrompt does not contain extractedName")
+                return false
+            }
+
+            return true
         }
 
-        return decision.storageConfidence >= 0.8 &&
-            decision.interactionSummary != nil &&
-            decision.evidenceQuote != nil
+        guard decision.storageConfidence >= 0.8 else { return false }
+        guard let summary = cleaned(decision.interactionSummary), !isGenericFieldPlaceholder(normalized(summary)) else {
+            print("MindAnchor policy: rejecting local LLM interaction memory because summary is missing or generic")
+            return false
+        }
+        guard let evidenceQuote = cleaned(decision.evidenceQuote), !isGenericFieldPlaceholder(normalized(evidenceQuote)) else {
+            print("MindAnchor policy: rejecting local LLM interaction memory because evidenceQuote is missing or generic")
+            return false
+        }
+
+        return true
+    }
+
+    private func cleaned(_ value: String?) -> String? {
+        let cleaned = value?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return cleaned?.isEmpty == false ? cleaned : nil
+    }
+
+    private func normalized(_ value: String) -> String {
+        value
+            .lowercased()
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .filter { $0.isLetter || $0.isNumber || $0.isWhitespace }
+    }
+
+    private func words(in value: String) -> [String] {
+        value
+            .split(whereSeparator: \.isWhitespace)
+            .map(String.init)
+            .filter { !$0.isEmpty }
+    }
+
+    private func isGenericNamePlaceholder(_ value: String) -> Bool {
+        [
+            "person",
+            "name",
+            "relationship",
+            "context",
+            "speaker",
+            "speaker a",
+            "conversation",
+            "transcript",
+            "someone",
+            "somebody",
+            "unknown",
+            "friend",
+            "patient",
+            "memory",
+            "interactionsummary",
+            "introduction",
+            "event",
+            "prototype",
+            "response",
+            "patientprompt"
+        ].contains(value)
+    }
+
+    private func containsUnsafePersonContext(_ value: String) -> Bool {
+        let normalizedValue = normalized(value)
+        return [
+            "likes little kids",
+            "like little kids",
+            "bad guy",
+            "bad things",
+            "creep",
+            "dangerous",
+            "not good"
+        ].contains { normalizedValue.contains($0) }
+    }
+
+    private func isGenericFieldPlaceholder(_ value: String) -> Bool {
+        [
+            "person",
+            "name",
+            "relationship",
+            "context",
+            "speaker",
+            "speaker a",
+            "speaker label",
+            "conversation",
+            "transcript",
+            "someone",
+            "somebody",
+            "unknown",
+            "patient",
+            "memory",
+            "interactionsummary",
+            "introduction",
+            "event",
+            "prototype",
+            "response",
+            "patientprompt"
+        ].contains(value)
     }
 
     private func decision(for candidate: LocalPersonProfileCandidate) -> TranscriptAnalysisDecision {
@@ -1067,6 +1240,7 @@ private struct MemoryCapturePolicy {
             emotionalContext: nil,
             followUpContext: nil,
             retentionHint: candidate.hasDurableContext ? "recent" : "identity",
+            patientPrompt: nil,
             patientSafeResponse: nil
         )
     }
@@ -1088,6 +1262,7 @@ private struct MemoryCapturePolicy {
             emotionalContext: nil,
             followUpContext: nil,
             retentionHint: "recent",
+            patientPrompt: nil,
             patientSafeResponse: nil
         )
     }
@@ -1099,6 +1274,7 @@ private struct LocalEpisodicMemoryExtractor {
         let wordCount = cleaned.split(whereSeparator: \.isWhitespace).count
         guard wordCount >= 2 else { return nil }
         guard !containsBlockedLanguage(cleaned) else { return nil }
+        guard !containsUnsafePersonContext(cleaned) else { return nil }
         guard !isMostlyNoise(cleaned) else { return nil }
 
         guard let name = extractName(from: cleaned) else { return nil }
@@ -1126,6 +1302,7 @@ private struct LocalEpisodicMemoryExtractor {
         let wordCount = cleaned.split(whereSeparator: \.isWhitespace).count
         guard wordCount >= 3 else { return nil }
         guard !containsBlockedLanguage(cleaned) else { return nil }
+        guard !containsUnsafePersonContext(cleaned) else { return nil }
         guard !isMostlyNoise(cleaned) else { return nil }
 
         let lowercased = cleaned.lowercased()
@@ -1147,6 +1324,7 @@ private struct LocalEpisodicMemoryExtractor {
         let wordCount = cleaned.split(whereSeparator: \.isWhitespace).count
         guard wordCount >= 3 else { return nil }
         guard !containsBlockedLanguage(cleaned) else { return nil }
+        guard !containsUnsafePersonContext(cleaned) else { return nil }
         guard !isMostlyNoise(cleaned) else { return nil }
         guard isCompleteEnough(cleaned) else { return nil }
         guard !endsWithIncompleteThought(cleaned) else { return nil }
@@ -1206,6 +1384,7 @@ private struct LocalEpisodicMemoryExtractor {
         let cleaned = cleanedTranscript(from: transcript)
         guard cleaned.split(whereSeparator: \.isWhitespace).count >= 4 else { return false }
         guard !containsBlockedLanguage(cleaned) else { return false }
+        guard !containsUnsafePersonContext(cleaned) else { return false }
         return true
     }
 
@@ -1373,6 +1552,11 @@ private struct LocalEpisodicMemoryExtractor {
         return blockedTerms.contains { lowercased.contains($0) }
     }
 
+    private func containsUnsafePersonContext(_ text: String) -> Bool {
+        let lowercased = text.lowercased()
+        return unsafePersonContextTerms.contains { lowercased.contains($0) }
+    }
+
     private func isCompleteEnough(_ text: String) -> Bool {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.hasSuffix(".") || trimmed.hasSuffix("?") || trimmed.hasSuffix("!") {
@@ -1538,6 +1722,11 @@ private struct LocalEpisodicMemoryExtractor {
         "fuck", "bitch", "shit", "asshole", "nigga", "nigger", "cunt"
     ]
 
+    private let unsafePersonContextTerms = [
+        "likes little kids", "like little kids", "bad guy", "bad things",
+        "creep", "dangerous", "not good"
+    ]
+
     private let noiseTerms = [
         "hdmi", "volume", "remote", "settings", "debug session"
     ]
@@ -1582,6 +1771,6 @@ private struct LocalEpisodicMemoryExtractor {
 
     private let nameStopWords = [
         "this", "that", "there", "here", "friend", "neighbor", "neighbour",
-        "home", "work", "school", "speaker"
+        "home", "work", "school", "speaker", "dork"
     ]
 }

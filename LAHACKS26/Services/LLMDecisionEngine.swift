@@ -42,6 +42,7 @@ struct TranscriptAnalysisDecision: Equatable {
     let emotionalContext: String?
     let followUpContext: String?
     let retentionHint: String?
+    let patientPrompt: String?
     let patientSafeResponse: String?
 }
 
@@ -158,7 +159,7 @@ struct ConversationAnalysisResult: Equatable {
 }
 
 extension TranscriptAnalysisDecision: CustomStringConvertible {
-    var description: String {
+    nonisolated var description: String {
         [
             "shouldStore=\(shouldStore)",
             "memoryType=\(memoryType.rawValue)",
@@ -172,6 +173,7 @@ extension TranscriptAnalysisDecision: CustomStringConvertible {
             "emotionalContext=\(emotionalContext ?? "nil")",
             "followUpContext=\(followUpContext ?? "nil")",
             "retentionHint=\(retentionHint ?? "nil")",
+            "patientPrompt=\(patientPrompt ?? "nil")",
             "patientSafeResponse=\(patientSafeResponse ?? "nil")"
         ].joined(separator: ", ")
     }
@@ -246,6 +248,7 @@ extension TranscriptAnalysisDecision {
             emotionalContext: nil,
             followUpContext: nil,
             retentionHint: nil,
+            patientPrompt: nil,
             patientSafeResponse: patientSafeResponse
         )
     }
@@ -254,44 +257,57 @@ extension TranscriptAnalysisDecision {
 #if canImport(FoundationModels)
 @available(iOS 26.0, *)
 actor AppleFoundationModelsDecisionEngine: LLMDecisionEngine {
-    private let model = SystemLanguageModel(useCase: .contentTagging)
+    private let model = SystemLanguageModel(useCase: .general)
     private let session: LanguageModelSession
+    private var isGenerationInFlight = false
 
     init() {
+        Self.log("initializing Apple Foundation Models decision engine; useCase=general")
         session = LanguageModelSession(
             model: model,
             instructions: """
-            You are MindAnchor's local memory coordinator. Decide whether a live speech transcript contains information worth storing in a private memory wiki for a person with early memory loss.
-
-            Be conservative. Most conversation should not be stored. Your output is a semantic analysis signal; a separate local MemoryCapturePolicy will make the final save/no-save decision using your fields plus transcript evidence.
-
-            Store explicit facts that are likely to help the patient later. This includes person identity, recent interactions, recent events, plans or intentions, preferences, important life facts, and emotional context.
-
-            Treat face-bound introductions as important. A name-only introduction such as "I am David" is a weak person candidate: store it as a low-confidence memory that can be enriched later. A name paired with relationship, role, school/work context, neighborhood context, caregiving context, or useful life context should be a stronger person memory.
-
-            Do not store greetings, jokes, acknowledgements, filler, uncertain guesses, or vague impressions. Store temporary information only when it is useful soon, such as plans, errands, travel, or recent events. If uncertain, set shouldStore to false. Keep patient responses short, calm, and safe. Do not make medical claims.
+            You extract one useful memory from a live transcript for an on-device memory aid.
+            Copy facts from the transcript. Do not invent facts. If a field is unknown, return null.
+            Never return placeholder words such as name, relationship, context, person, memory, sentence, response, or patientPrompt.
             """
         )
+        Self.log("session initialized; model.isAvailable=\(model.isAvailable)")
     }
 
     func analyzeTranscript(_ transcript: String) async -> TranscriptAnalysisDecision {
+        Self.log("analyzeTranscript requested; transcriptChars=\(transcript.count); model.isAvailable=\(model.isAvailable)")
         guard model.isAvailable else {
+            Self.log("analyzeTranscript skipped because model.isAvailable=false")
             return .ignored(patientSafeResponse: nil)
         }
 
+        await waitForGenerationTurn(label: "analyzeTranscript")
+        isGenerationInFlight = true
+        defer {
+            isGenerationInFlight = false
+            Self.log("analyzeTranscript generation turn released")
+        }
+
+        let prompt = prompt(for: transcript)
+        Self.log("analyzeTranscript sending request; promptChars=\(prompt.count)")
+        Self.logPrompt("analyzeTranscript", prompt)
         do {
             let response = try await session.respond(
-                to: prompt(for: transcript),
-                schema: Self.decisionSchema,
+                to: prompt,
+                schema: Self.extractionSchema,
                 options: GenerationOptions(
                     sampling: .greedy,
                     temperature: 0,
-                    maximumResponseTokens: 130
+                    maximumResponseTokens: 220
                 )
             )
 
-            return try makeDecision(from: response.content)
+            Self.log("analyzeTranscript response received; parsing structured content")
+            let decision = try makeDecision(from: response.content)
+            Self.log("analyzeTranscript parsed decision: \(decision)")
+            return decision
         } catch {
+            Self.log("analyzeTranscript failed: \(Self.errorDescription(error))")
             return .ignored(patientSafeResponse: nil)
         }
     }
@@ -305,10 +321,8 @@ actor AppleFoundationModelsDecisionEngine: LLMDecisionEngine {
             previousState: previousState,
             transcript: recentTranscript,
             instructions: """
-            This is a fast live layer while the patient is looking at the person.
-            Update provisional beliefs, and set shouldStore true as soon as the transcript contains a clear patient-useful memory. Focus on semantic classification and extraction; a separate policy layer will handle final storage.
-            Useful memories include introductions, weak name-only person candidates, plans, errands, recent events, deaths or funerals, travel, caregiving context, preferences, emotional context, or what this person last talked about.
-            Keep shouldStore false for partial, ambiguous, or merely social speech. Never invent placeholder values such as "person", "relationship", "context", or "name". Every stored memory must include an exact evidenceQuote copied from the transcript.
+            Extract a memory only if the current live transcript already contains a clear name, relationship, useful context, plan, preference, recent event, or important fact.
+            Name-only introductions are valid weak person memories.
             """
         )
     }
@@ -322,10 +336,8 @@ actor AppleFoundationModelsDecisionEngine: LLMDecisionEngine {
             previousState: previousState,
             transcript: transcriptWindow,
             instructions: """
-            This is a periodic reconciliation layer over a wider rolling transcript window.
-            Correct earlier misunderstandings, merge duplicate entities, revise confidence scores, and remove weak facts. Focus on semantic classification and extraction; a separate policy layer will handle final storage.
-            Set shouldStore true for any clear patient-useful memory: identity, last interaction, recent event, plan, preference, important life fact, or emotional context.
-            Every stored memory must include an exact evidenceQuote copied from the transcript.
+            Re-read the wider transcript and extract the single clearest patient-useful memory.
+            Prefer a named person memory when a person introduction appears.
             """
         )
     }
@@ -339,10 +351,8 @@ actor AppleFoundationModelsDecisionEngine: LLMDecisionEngine {
             previousState: previousState,
             transcript: fullTranscript,
             instructions: """
-            This is the final full-context pass after the face-bound conversation ended.
-            Produce the cleanest relationship graph, interaction summary, and semantic storage recommendation. A separate policy layer will handle final storage.
-            Set shouldStore true for any clear patient-useful memory: identity, last interaction, recent event, plan, preference, important life fact, or emotional context.
-            Every stored memory must include an exact evidenceQuote copied from the transcript.
+            This is the final pass after the face-bound conversation ended.
+            Extract the single best memory from the whole transcript. Prefer the introduced person's identity and useful context.
             """
         )
     }
@@ -353,36 +363,50 @@ actor AppleFoundationModelsDecisionEngine: LLMDecisionEngine {
         transcript: String,
         instructions: String
     ) async -> ConversationAnalysisResult {
+        Self.log("conversation \(phase) requested; transcriptChars=\(transcript.count); previousState=\(previousState.promptJSON); model.isAvailable=\(model.isAvailable)")
         guard model.isAvailable else {
+            Self.log("conversation \(phase) skipped because model.isAvailable=false")
             return ConversationAnalysisResult(
                 conversationState: previousState,
                 decision: .ignored(patientSafeResponse: nil)
             )
         }
 
+        await waitForGenerationTurn(label: "conversation \(phase)")
+        isGenerationInFlight = true
+        defer {
+            isGenerationInFlight = false
+            Self.log("conversation \(phase) generation turn released")
+        }
+
+        let prompt = conversationPrompt(
+            phase: phase,
+            previousState: previousState,
+            transcript: transcript,
+            instructions: instructions
+        )
+        Self.log("conversation \(phase) sending request; promptChars=\(prompt.count)")
+        Self.logPrompt("conversation \(phase)", prompt)
         do {
             let response = try await session.respond(
-                to: conversationPrompt(
-                    phase: phase,
-                    previousState: previousState,
-                    transcript: transcript,
-                    instructions: instructions
-                ),
-                schema: Self.conversationSchema,
+                to: prompt,
+                schema: Self.extractionSchema,
                 options: GenerationOptions(
                     sampling: .greedy,
                     temperature: 0,
-                    maximumResponseTokens: 420
+                    maximumResponseTokens: 220
                 )
             )
-            let stateJSON = try response.content.value(String.self, forProperty: "conversationStateJSON")
-            let updatedState = ConversationState.decoded(from: stateJSON) ?? previousState
+            Self.log("conversation \(phase) response received; parsing extraction")
+            let decision = try makeDecision(from: response.content)
+            Self.log("conversation \(phase) parsed decision: \(decision)")
 
             return ConversationAnalysisResult(
-                conversationState: updatedState,
-                decision: try makeDecision(from: response.content)
+                conversationState: previousState,
+                decision: decision
             )
         } catch {
+            Self.log("conversation \(phase) failed: \(Self.errorDescription(error))")
             return ConversationAnalysisResult(
                 conversationState: previousState,
                 decision: .ignored(patientSafeResponse: nil)
@@ -392,46 +416,23 @@ actor AppleFoundationModelsDecisionEngine: LLMDecisionEngine {
 
     private func prompt(for transcript: String) -> String {
         """
-        Analyze this transcript and return only the requested structured decision.
+        Extract one memory from this transcript.
 
         Transcript:
         \(transcript)
 
-        The transcript may combine nearby speech fragments from the same active face profile. Treat them as one face-bound conversation. For example, "I am David" followed by "We go to the same school" should become one saved person memory for David with helpful context "goes to the same school".
+        Return action "storePerson" for introductions like "This is Maya", "I am David", or "my name is Rishab".
+        Return action "storePerson" when the transcript gives a real person's name plus useful context.
+        Return action "storeFact" only for a clear patient-useful fact, event, preference, plan, routine, or emotional context.
+        Return action "ignore" for vague, negative, or unsupported comments unless there is a real name or relationship.
 
-        Field requirements:
-        - shouldStore: true only when the transcript contains explicit durable memory information worth saving for later patient support.
-        - memoryType: one of person, lastInteraction, recentEvent, emotionalContext, planOrIntention, preference, importantLifeFact, routine, none.
-        - importance: one of low, medium, high.
-        - storageConfidence: number from 0.0 to 1.0 for confidence this should be stored.
-        - extractedName: person name when available, otherwise null.
-        - extractedRelationship: relationship or social context when available, otherwise null.
-        - extractedHelpfulContext: practical helpful context when available, otherwise null.
-        - interactionSummary: one short sentence summarizing what the patient should remember, otherwise null.
-        - evidenceQuote: exact quote copied from the transcript that supports the memory, otherwise null.
-        - emotionalContext: short emotional context such as "grieving", "excited", or "stressed", otherwise null.
-        - followUpContext: gentle future reminder or follow-up context, otherwise null.
-        - retentionHint: one of shortTerm, recent, longTerm, otherwise null.
-        - patientSafeResponse: short spoken response if storing, otherwise null.
-
-        Conservative storage policy:
-        - Set shouldStore false unless the transcript contains a complete, useful memory.
-        - A named person introduction is a useful weak person candidate in this face-bound capture flow, even if relationship or context is not known yet.
-        - A named self-introduction with school, work, role, neighborhood, caregiving, or practical life context is a complete useful memory.
-        - A recent event, plan, preference, emotionally important life event, or last-interaction detail can be useful even without a person name.
-        - For person memories, extractedName must be non-null. extractedRelationship and extractedHelpfulContext can be null if only the name was captured.
-        - For non-person memories, interactionSummary and evidenceQuote must be non-null.
-        - Use storageConfidence 0.45 to 0.65 for weak name-only person candidates.
-        - Use storageConfidence below 0.8 whenever the transcript is ambiguous, incomplete, or merely social unless it is a clear name-only introduction.
-        - Never use placeholders such as "person", "relationship", "context", or "name" as extracted values.
-        - Examples of store-worthy memories:
-          "This is Akshay, he's my grandson" -> memoryType person.
-          "I am David" -> shouldStore true, memoryType person, importance low, extractedName "David", extractedRelationship null, extractedHelpfulContext null, storageConfidence 0.55.
-          "I am David. We go to the same school" -> shouldStore true, memoryType person, extractedName "David", extractedHelpfulContext "goes to the same school".
-          "Hello, I'm Rishab. I go to school." -> memoryType person, extractedName "Rishab", extractedHelpfulContext "goes to school", storageConfidence at least 0.85.
-          "I just got back from my brother's funeral" -> memoryType emotionalContext or recentEvent.
-          "I'm heading to the store, do you need anything?" -> memoryType planOrIntention with shortTerm retention.
-          "I love black coffee in the morning" -> memoryType preference.
+        Required behavior:
+        - name must be a real name copied from the transcript, otherwise null.
+        - relationship must be copied or directly paraphrased from the transcript, otherwise null.
+        - context must be a short useful phrase supported by the transcript, otherwise null.
+        - evidenceQuote must be an exact quote from the transcript when action is not ignore.
+        - patientPrompt should be one short sentence for recognizing the person later, such as "This is Maya." or "This is Akshay, your grandson."
+        - Never output placeholder values.
         """
     }
 
@@ -444,75 +445,45 @@ actor AppleFoundationModelsDecisionEngine: LLMDecisionEngine {
         """
         \(instructions)
 
-        Previous structured conversation state JSON:
+        Previous conversation context, if any:
         \(previousState.promptJSON)
 
-        New \(phase) transcript input:
+        New \(phase) transcript:
         \(transcript)
 
-        This input may include nearby fragments from the same active face profile. Combine them before deciding. If one fragment gives the name and a later fragment gives school, neighborhood, work, caregiver, or helpful context, store/update one person memory.
-
-        Return:
-        - conversationStateJSON: valid compact JSON with this shape:
-          {
-            "people": [
-              {
-                "speakerLabel": "Speaker A",
-                "possibleName": null,
-                "role": null,
-                "relationship": null,
-                "confidence": 0.0
-              }
-            ],
-            "openQuestions": [],
-            "importantFacts": [],
-            "revisionNotes": []
-          }
-        - Decision fields using the storage rules below.
-
-        Treat live beliefs as provisional. Use wording and confidence that allow revision. Prefer "may be" relationships in state unless confirmed by later context.
-
-        Storage rules:
-        - shouldStore should be true during live, reconciliation, or final when the transcript contains clear patient-useful memory.
-        - Person memories require a clear name. A relationship, role, school/work context, neighborhood context, caregiving context, or helpful practical context is useful but not required.
-        - Last interaction, recent event, emotional context, plan, preference, important life fact, or routine memories require interactionSummary and exact evidenceQuote.
-        - Use storageConfidence 0.45 to 0.65 for weak name-only person candidates.
-        - Use storageConfidence below 0.8 for ambiguous, partial, social, or temporary statements unless it is a clear name-only introduction.
-        - Never use placeholders such as "person", "relationship", "context", or "name" as extracted values.
-        - Examples of outputs that should store:
-          "This is Akshay, he's my grandson" -> shouldStore true, memoryType person, extractedName "Akshay", extractedRelationship "grandson", storageConfidence at least 0.85.
-          "This is Maya, my neighbor from next door" -> shouldStore true, memoryType person, extractedName "Maya", extractedRelationship "neighbor from next door", storageConfidence at least 0.85.
-          "I am David" -> shouldStore true, memoryType person, importance low, extractedName "David", extractedRelationship null, extractedHelpfulContext null, storageConfidence 0.55.
-          "I am David. We go to the same school" -> shouldStore true, memoryType person, extractedName "David", extractedHelpfulContext "goes to the same school", storageConfidence at least 0.75.
-          "Hello, I'm Rishab. I go to school." -> shouldStore true, memoryType person, extractedName "Rishab", extractedHelpfulContext "goes to school", storageConfidence at least 0.85.
-          "I just got back from my brother's funeral" -> shouldStore true, memoryType emotionalContext, interactionSummary "They recently got back from their brother's funeral.", evidenceQuote "I just got back from my brother's funeral".
-          "I'm going to the store" -> shouldStore true, memoryType planOrIntention, interactionSummary "They said they were going to the store.", retentionHint shortTerm.
+        Extract exactly one memory using the same rules:
+        - action: ignore, storePerson, storeFact, storePlan, storePreference, storeRecentEvent, storeEmotionalContext, or storeRoutine.
+        - For storePerson, name must be a real name from the transcript.
+        - For non-person actions, summary and evidenceQuote are required.
+        - Use null for unknown fields.
+        - Never output placeholder values like name, relationship, context, person, memory, sentence, response, or patientPrompt.
         """
     }
 
     private func makeDecision(from content: GeneratedContent) throws -> TranscriptAnalysisDecision {
-        let shouldStore = try content.value(Bool.self, forProperty: "shouldStore")
-        let memoryType = try enumValue(
-            MemoryType.self,
-            content.value(String.self, forProperty: "memoryType"),
-            fallback: .none
-        )
-        let importance = try enumValue(
-            MemoryImportance.self,
-            content.value(String.self, forProperty: "importance"),
-            fallback: .low
-        )
+        let action = try cleaned(content.value(String.self, forProperty: "action")) ?? "ignore"
+        let normalizedAction = normalized(action)
         let confidence = try content.value(Double.self, forProperty: "storageConfidence")
 
-        let extractedName = try cleaned(content.value(String?.self, forProperty: "extractedName"))
-        let extractedRelationship = try cleaned(content.value(String?.self, forProperty: "extractedRelationship"))
-        let extractedHelpfulContext = try cleaned(content.value(String?.self, forProperty: "extractedHelpfulContext"))
-        let interactionSummary = try cleaned(content.value(String?.self, forProperty: "interactionSummary"))
+        let extractedName = try cleaned(content.value(String?.self, forProperty: "name"))
+        let extractedRelationship = try cleaned(content.value(String?.self, forProperty: "relationship"))
+        let extractedHelpfulContext = try cleaned(content.value(String?.self, forProperty: "context"))
+        let interactionSummary = try cleaned(content.value(String?.self, forProperty: "summary"))
         let evidenceQuote = try cleaned(content.value(String?.self, forProperty: "evidenceQuote"))
-        let emotionalContext = try cleaned(content.value(String?.self, forProperty: "emotionalContext"))
-        let followUpContext = try cleaned(content.value(String?.self, forProperty: "followUpContext"))
-        let retentionHint = try cleaned(content.value(String?.self, forProperty: "retentionHint"))
-        let patientSafeResponse = try cleaned(content.value(String?.self, forProperty: "patientSafeResponse"))
+        let patientPrompt = try cleaned(content.value(String?.self, forProperty: "patientPrompt"))
+
+        let memoryType = memoryType(for: normalizedAction)
+        let shouldStore = memoryType != .none
+        let importance = importance(for: memoryType, confidence: confidence)
+        let emotionalContext = memoryType == .emotionalcontext ? (extractedHelpfulContext ?? interactionSummary) : nil
+        let followUpContext: String? = nil
+        let retentionHint = retentionHint(for: memoryType)
+        let patientSafeResponse: String? = nil
+        Self.log(
+            """
+            raw extraction fields: action=\(action), mappedMemoryType=\(memoryType.rawValue), confidence=\(confidence), name=\(extractedName ?? "nil"), relationship=\(extractedRelationship ?? "nil"), context=\(extractedHelpfulContext ?? "nil"), summary=\(interactionSummary ?? "nil"), evidenceQuote=\(evidenceQuote ?? "nil"), patientPrompt=\(patientPrompt ?? "nil")
+            """
+        )
 
         let rejectedDecision = TranscriptAnalysisDecision(
             shouldStore: false,
@@ -527,20 +498,29 @@ actor AppleFoundationModelsDecisionEngine: LLMDecisionEngine {
             emotionalContext: emotionalContext,
             followUpContext: followUpContext,
             retentionHint: retentionHint,
+            patientPrompt: patientPrompt,
             patientSafeResponse: patientSafeResponse
         )
 
         let minimumConfidence = memoryType == .person && extractedName != nil ? 0.45 : 0.75
         guard shouldStore, memoryType != .none, confidence >= minimumConfidence else {
+            Self.log("decision rejected by minimum gate; shouldStore=\(shouldStore), memoryType=\(memoryType.rawValue), confidence=\(confidence), minimumConfidence=\(minimumConfidence)")
             return rejectedDecision
         }
 
         if memoryType == .person {
-            guard extractedName != nil else {
+            guard let extractedName, !isPlaceholderValue(extractedName) else {
+                Self.log("decision rejected because person memory has no extractedName")
                 return rejectedDecision
             }
         } else {
-            guard interactionSummary != nil, evidenceQuote != nil else {
+            guard
+                let interactionSummary,
+                let evidenceQuote,
+                !isPlaceholderValue(interactionSummary),
+                !isPlaceholderValue(evidenceQuote)
+            else {
+                Self.log("decision rejected because non-person memory lacks summary or evidenceQuote")
                 return rejectedDecision
             }
         }
@@ -558,6 +538,7 @@ actor AppleFoundationModelsDecisionEngine: LLMDecisionEngine {
             emotionalContext: emotionalContext,
             followUpContext: followUpContext,
             retentionHint: retentionHint,
+            patientPrompt: patientPrompt,
             patientSafeResponse: patientSafeResponse
         )
     }
@@ -575,74 +556,121 @@ actor AppleFoundationModelsDecisionEngine: LLMDecisionEngine {
         return trimmed?.isEmpty == false ? trimmed : nil
     }
 
-    private static let decisionSchema = GenerationSchema(
-        type: GeneratedContent.self,
-        description: "A structured MindAnchor transcript storage decision.",
-        properties: [
-            GenerationSchema.Property(name: "shouldStore", description: "Whether the transcript should be stored as memory.", type: Bool.self),
-            GenerationSchema.Property(
-                name: "memoryType",
-                description: "The type of memory represented by the transcript.",
-                type: String.self,
-                guides: [.anyOf(["person", "lastInteraction", "recentEvent", "emotionalContext", "planOrIntention", "preference", "importantLifeFact", "routine", "none"])]
-            ),
-            GenerationSchema.Property(
-                name: "importance",
-                description: "How important the memory is for future support.",
-                type: String.self,
-                guides: [.anyOf(["low", "medium", "high"])]
-            ),
-            GenerationSchema.Property(
-                name: "storageConfidence",
-                description: "Confidence from 0.0 to 1.0 that this transcript should be stored.",
-                type: Double.self,
-                guides: [.minimum(0), .maximum(1)]
-            ),
-            GenerationSchema.Property(name: "extractedName", description: "The person's name, if the transcript introduces someone.", type: String?.self),
-            GenerationSchema.Property(name: "extractedRelationship", description: "The person's relationship or social context, if present.", type: String?.self),
-            GenerationSchema.Property(name: "extractedHelpfulContext", description: "A helpful practical context phrase, if present.", type: String?.self),
-            GenerationSchema.Property(name: "interactionSummary", description: "A short patient-useful summary of the memory, or null.", type: String?.self),
-            GenerationSchema.Property(name: "evidenceQuote", description: "An exact quote copied from the transcript that supports the memory, or null.", type: String?.self),
-            GenerationSchema.Property(name: "emotionalContext", description: "Brief emotional context, or null.", type: String?.self),
-            GenerationSchema.Property(name: "followUpContext", description: "Gentle future reminder or follow-up context, or null.", type: String?.self),
-            GenerationSchema.Property(name: "retentionHint", description: "shortTerm, recent, longTerm, or null.", type: String?.self),
-            GenerationSchema.Property(name: "patientSafeResponse", description: "A short spoken response for the patient, or null.", type: String?.self)
-        ]
-    )
+    private func memoryType(for action: String) -> MemoryType {
+        switch action {
+        case "storeperson":
+            return .person
+        case "storeplan":
+            return .planorintention
+        case "storepreference":
+            return .preference
+        case "storerecentevent":
+            return .recentevent
+        case "storeemotionalcontext":
+            return .emotionalcontext
+        case "storeroutine":
+            return .routine
+        case "storefact":
+            return .importantlifefact
+        default:
+            return .none
+        }
+    }
 
-    private static let conversationSchema = GenerationSchema(
+    private func importance(for memoryType: MemoryType, confidence: Double) -> MemoryImportance {
+        if memoryType == .none || confidence < 0.65 {
+            return .low
+        }
+        if confidence >= 0.85 || memoryType == .emotionalcontext || memoryType == .importantlifefact {
+            return .high
+        }
+        return .medium
+    }
+
+    private func retentionHint(for memoryType: MemoryType) -> String? {
+        switch memoryType {
+        case .planorintention:
+            return "shortTerm"
+        case .recentevent, .lastinteraction:
+            return "recent"
+        case .person, .preference, .importantlifefact, .routine, .emotionalcontext:
+            return "longTerm"
+        case .none:
+            return nil
+        }
+    }
+
+    private func normalized(_ value: String) -> String {
+        value
+            .lowercased()
+            .filter { $0.isLetter || $0.isNumber }
+    }
+
+    private func isPlaceholderValue(_ value: String) -> Bool {
+        [
+            "name",
+            "relationship",
+            "context",
+            "person",
+            "memory",
+            "sentence",
+            "response",
+            "patientprompt",
+            "summary",
+            "evidencequote",
+            "unknown",
+            "none"
+        ].contains(normalized(value))
+    }
+
+    private func waitForGenerationTurn(label: String) async {
+        var waitCount = 0
+        while isGenerationInFlight || session.isResponding {
+            waitCount += 1
+            Self.log("\(label) waiting for previous Foundation Models response; waitCount=\(waitCount), session.isResponding=\(session.isResponding)")
+            try? await Task.sleep(for: .milliseconds(150))
+        }
+    }
+
+    nonisolated private static func log(_ message: String) {
+        print("MindAnchor local LLM:", message)
+    }
+
+    nonisolated private static func logPrompt(_ label: String, _ prompt: String) {
+        let maxCharacters = 12_000
+        let loggedPrompt = prompt.count > maxCharacters
+            ? String(prompt.prefix(maxCharacters)) + "\n[truncated \(prompt.count - maxCharacters) chars]"
+            : prompt
+        print("MindAnchor local LLM prompt BEGIN [\(label)]\n\(loggedPrompt)\nMindAnchor local LLM prompt END [\(label)]")
+    }
+
+    nonisolated private static func errorDescription(_ error: Error) -> String {
+        let nsError = error as NSError
+        return "domain=\(nsError.domain), code=\(nsError.code), description=\(nsError.localizedDescription), failureReason=\(nsError.localizedFailureReason ?? "nil"), recoverySuggestion=\(nsError.localizedRecoverySuggestion ?? "nil"), userInfo=\(nsError.userInfo)"
+    }
+
+    private static let extractionSchema = GenerationSchema(
         type: GeneratedContent.self,
-        description: "A structured MindAnchor conversation state update and storage decision.",
+        description: "One simple memory extraction from a transcript.",
         properties: [
-            GenerationSchema.Property(name: "conversationStateJSON", description: "Valid compact JSON for the updated provisional conversation state.", type: String.self),
-            GenerationSchema.Property(name: "shouldStore", description: "Whether this pass should store a patient-facing memory.", type: Bool.self),
             GenerationSchema.Property(
-                name: "memoryType",
-                description: "The type of memory represented by the transcript.",
+                name: "action",
+                description: "What to do with the transcript.",
                 type: String.self,
-                guides: [.anyOf(["person", "lastInteraction", "recentEvent", "emotionalContext", "planOrIntention", "preference", "importantLifeFact", "routine", "none"])]
-            ),
-            GenerationSchema.Property(
-                name: "importance",
-                description: "How important the memory is for future support.",
-                type: String.self,
-                guides: [.anyOf(["low", "medium", "high"])]
+                guides: [.anyOf(["ignore", "storePerson", "storeFact", "storePlan", "storePreference", "storeRecentEvent", "storeEmotionalContext", "storeRoutine"])]
             ),
             GenerationSchema.Property(
                 name: "storageConfidence",
-                description: "Confidence from 0.0 to 1.0 that this transcript should be stored.",
+                description: "Confidence from 0.0 to 1.0 that this extraction is supported by the transcript.",
                 type: Double.self,
                 guides: [.minimum(0), .maximum(1)]
             ),
-            GenerationSchema.Property(name: "extractedName", description: "The person's name, if the transcript introduces someone.", type: String?.self),
-            GenerationSchema.Property(name: "extractedRelationship", description: "The person's relationship or social context, if present.", type: String?.self),
-            GenerationSchema.Property(name: "extractedHelpfulContext", description: "A helpful practical context phrase, if present.", type: String?.self),
-            GenerationSchema.Property(name: "interactionSummary", description: "A short patient-useful summary of the memory, or null.", type: String?.self),
+            GenerationSchema.Property(name: "name", description: "A real person's name copied from the transcript, or null.", type: String?.self),
+            GenerationSchema.Property(name: "relationship", description: "The person's relationship or social context supported by the transcript, or null.", type: String?.self),
+            GenerationSchema.Property(name: "context", description: "A short useful context phrase supported by the transcript, or null.", type: String?.self),
+            GenerationSchema.Property(name: "summary", description: "One short patient-useful summary for non-person memories, or null.", type: String?.self),
             GenerationSchema.Property(name: "evidenceQuote", description: "An exact quote copied from the transcript that supports the memory, or null.", type: String?.self),
-            GenerationSchema.Property(name: "emotionalContext", description: "Brief emotional context, or null.", type: String?.self),
-            GenerationSchema.Property(name: "followUpContext", description: "Gentle future reminder or follow-up context, or null.", type: String?.self),
-            GenerationSchema.Property(name: "retentionHint", description: "shortTerm, recent, longTerm, or null.", type: String?.self),
-            GenerationSchema.Property(name: "patientSafeResponse", description: "A short spoken response for the patient, or null.", type: String?.self)
+            GenerationSchema.Property(name: "patientPrompt", description: "For person memories only, one clean recognition sentence supported by the transcript, or null.", type: String?.self)
         ]
     )
 }

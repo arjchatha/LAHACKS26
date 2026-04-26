@@ -159,6 +159,7 @@ protocol MemoryBridge: AnyObject {
         extractedName: String?,
         extractedRelationship: String?,
         extractedHelpfulContext: String?,
+        patientPrompt: String?,
         faceProfileId: String,
         confidence: Double
     ) -> DemoPersonMemory?
@@ -226,6 +227,7 @@ final class MockMemoryBridge: ObservableObject, MemoryBridge {
         extractedName: String?,
         extractedRelationship: String?,
         extractedHelpfulContext: String?,
+        patientPrompt generatedPatientPrompt: String? = nil,
         faceProfileId: String,
         confidence: Double
     ) -> DemoPersonMemory? {
@@ -236,11 +238,12 @@ final class MockMemoryBridge: ObservableObject, MemoryBridge {
         let personId = stablePersonId(for: name, faceProfileId: faceProfileId)
         let relationship = clean(extractedRelationship, fallback: "Unknown")
         let helpfulContext = clean(extractedHelpfulContext, fallback: "Not captured yet")
-        let prompt = patientPrompt(
-            name: name,
-            relationship: relationship,
-            helpfulContext: helpfulContext
-        )
+        let prompt = cleanPatientPrompt(generatedPatientPrompt, name: name)
+            ?? patientPrompt(
+                name: name,
+                relationship: relationship,
+                helpfulContext: helpfulContext
+            )
         let evidenceEntries = transcriptEvidenceEntries(from: transcript)
         let now = Date()
 
@@ -451,6 +454,7 @@ final class MockMemoryBridge: ObservableObject, MemoryBridge {
             extractedName: cleanName,
             extractedRelationship: relationship.isEmpty ? nil : relationship,
             extractedHelpfulContext: profile.memoryCue,
+            patientPrompt: profile.memoryCue,
             faceProfileId: faceProfileId,
             confidence: 1.0
         )
@@ -575,6 +579,7 @@ final class MockMemoryBridge: ObservableObject, MemoryBridge {
             extractedName: cleanName,
             extractedRelationship: cleanRelationship.isEmpty ? nil : cleanRelationship,
             extractedHelpfulContext: enteredMemoryCue.isEmpty ? "Face profile ready for recognition." : enteredMemoryCue,
+            patientPrompt: cleanMemoryCue,
             faceProfileId: faceProfileId,
             confidence: 1.0
         )
@@ -751,6 +756,7 @@ final class MockMemoryBridge: ObservableObject, MemoryBridge {
                 extractedName: profile.name,
                 extractedRelationship: profile.relationship.isEmpty ? nil : profile.relationship,
                 extractedHelpfulContext: profile.memoryCue,
+                patientPrompt: profile.memoryCue,
                 faceProfileId: profile.faceProfileId,
                 confidence: 1.0
             )
@@ -778,6 +784,7 @@ final class MockMemoryBridge: ObservableObject, MemoryBridge {
                 extractedName: profile.name,
                 extractedRelationship: profile.relationship.isEmpty ? nil : profile.relationship,
                 extractedHelpfulContext: profile.memoryCue,
+                patientPrompt: profile.memoryCue,
                 faceProfileId: profile.faceProfileId,
                 confidence: 1.0
             )
@@ -1007,6 +1014,35 @@ final class MockMemoryBridge: ObservableObject, MemoryBridge {
         }
 
         return "This is \(name), your \(relationship).\(context)"
+    }
+
+    private func cleanPatientPrompt(_ value: String?, name: String) -> String? {
+        let prompt = value?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+
+        guard var prompt, !prompt.isEmpty else { return nil }
+        guard prompt.count <= 220 else { return nil }
+        guard prompt.localizedCaseInsensitiveContains(name) else { return nil }
+
+        let lowercased = prompt.lowercased()
+        let blockedFragments = [
+            "patient prompt",
+            "helpful context",
+            "extracted",
+            "unknown face",
+            "not captured",
+            "no context",
+            "speech recognition",
+            "transcript"
+        ]
+        guard !blockedFragments.contains(where: { lowercased.contains($0) }) else { return nil }
+
+        let terminalPunctuation = CharacterSet(charactersIn: ".!?")
+        if prompt.rangeOfCharacter(from: terminalPunctuation, options: .backwards)?.upperBound != prompt.endIndex {
+            prompt += "."
+        }
+        return prompt
     }
 
     private func patientPrompt(for interaction: InteractionMemory) -> String {
