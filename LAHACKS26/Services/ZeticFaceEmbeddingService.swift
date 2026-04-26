@@ -33,25 +33,8 @@ final class ZeticFaceEmbeddingService {
     private enum Constants {
         static let personalKey = "dev_fdc9e57ff6d34bc6a590307ae5b0b101"
         static let modelName = "arjun/LAHACKS_FacialRecognition"
-        static let modelVersion = 2
+        static let modelVersion = 6
         static let sideLength = 112
-    }
-
-    private enum ChannelOrder {
-        case rgb
-        case bgr
-    }
-
-    private enum TensorPacking {
-        case hwc
-        case chw
-    }
-
-    private enum RecognitionTensorLayout {
-        case rgbHwc
-        case bgrHwc
-        case rgbChw
-        case bgrChw
     }
 
     #if canImport(ZeticMLange)
@@ -78,19 +61,12 @@ final class ZeticFaceEmbeddingService {
 
     func embedding(for croppedFaceImage: CGImage) throws -> [Float] {
         #if canImport(ZeticMLange)
-        let inputs = recognitionTensors(from: croppedFaceImage)
-
-        for tensor in inputs {
-            do {
-                let outputs = try model.run(inputs: [tensor])
-                if let firstOutput = outputs.first {
-                    let embedding = DataUtils.dataToFloatArray(firstOutput.data)
-                    if !embedding.isEmpty, embedding.allSatisfy(\.isFinite) {
-                        return embedding
-                    }
-                }
-            } catch {
-                continue
+        let tensor = try recognitionTensor(from: croppedFaceImage)
+        let outputs = try model.run(inputs: [tensor])
+        if let firstOutput = outputs.first {
+            let embedding = DataUtils.dataToFloatArray(firstOutput.data)
+            if !embedding.isEmpty, embedding.allSatisfy(\.isFinite) {
+                return embedding
             }
         }
 
@@ -102,25 +78,12 @@ final class ZeticFaceEmbeddingService {
     }
 
     #if canImport(ZeticMLange)
-    private func recognitionTensors(from cgImage: CGImage) -> [Tensor] {
-        let layouts: [(RecognitionTensorLayout, [Float])] = [
-            (.rgbChw, renderAndNormalize(cgImage: cgImage, channelOrder: .rgb, packing: .chw)),
-            (.bgrChw, renderAndNormalize(cgImage: cgImage, channelOrder: .bgr, packing: .chw)),
-            (.rgbHwc, renderAndNormalize(cgImage: cgImage, channelOrder: .rgb, packing: .hwc)),
-            (.bgrHwc, renderAndNormalize(cgImage: cgImage, channelOrder: .bgr, packing: .hwc))
-        ]
-
-        return layouts.compactMap { layout, floats in
-            guard !floats.isEmpty else { return nil }
-            return try? tensor(from: floats, layout: layout)
-        }
+    private func recognitionTensor(from cgImage: CGImage) throws -> Tensor {
+        let floats = renderAndNormalize(cgImage: cgImage)
+        return try tensor(from: floats)
     }
 
-    private func renderAndNormalize(
-        cgImage: CGImage,
-        channelOrder: ChannelOrder,
-        packing: TensorPacking
-    ) -> [Float] {
+    private func renderAndNormalize(cgImage: CGImage) -> [Float] {
         let width = Constants.sideLength
         let height = Constants.sideLength
         let bytesPerPixel = 4
@@ -151,61 +114,25 @@ final class ZeticFaceEmbeddingService {
         }
 
         let pixelCount = width * height
-        var rChannel = [Float](repeating: 0, count: pixelCount)
-        var gChannel = [Float](repeating: 0, count: pixelCount)
-        var bChannel = [Float](repeating: 0, count: pixelCount)
+        var floats = [Float](repeating: 0, count: pixelCount * 3)
 
         for index in 0..<pixelCount {
             let base = index * bytesPerPixel
-            rChannel[index] = (Float(pixels[base]) - 127.5) / 128.0
-            gChannel[index] = (Float(pixels[base + 1]) - 127.5) / 128.0
-            bChannel[index] = (Float(pixels[base + 2]) - 127.5) / 128.0
+            floats[index] = (Float(pixels[base]) - 127.5) / 127.5
+            floats[pixelCount + index] = (Float(pixels[base + 1]) - 127.5) / 127.5
+            floats[(pixelCount * 2) + index] = (Float(pixels[base + 2]) - 127.5) / 127.5
         }
 
-        switch packing {
-        case .hwc:
-            var floats: [Float] = []
-            floats.reserveCapacity(pixelCount * 3)
-
-            for index in 0..<pixelCount {
-                switch channelOrder {
-                case .rgb:
-                    floats.append(rChannel[index])
-                    floats.append(gChannel[index])
-                    floats.append(bChannel[index])
-                case .bgr:
-                    floats.append(bChannel[index])
-                    floats.append(gChannel[index])
-                    floats.append(rChannel[index])
-                }
-            }
-
-            return floats
-        case .chw:
-            switch channelOrder {
-            case .rgb:
-                return rChannel + gChannel + bChannel
-            case .bgr:
-                return bChannel + gChannel + rChannel
-            }
-        }
+        return floats
     }
 
-    private func tensor(from normalizedFloats: [Float], layout: RecognitionTensorLayout) throws -> Tensor {
+    private func tensor(from normalizedFloats: [Float]) throws -> Tensor {
         let data = normalizedFloats.withUnsafeBufferPointer { Data(buffer: $0) }
-        let shape: [Int]
-
-        switch layout {
-        case .rgbHwc, .bgrHwc:
-            shape = [1, Constants.sideLength, Constants.sideLength, 3]
-        case .rgbChw, .bgrChw:
-            shape = [1, 3, Constants.sideLength, Constants.sideLength]
-        }
 
         return Tensor(
             data: data,
             dataType: BuiltinDataType.float32,
-            shape: shape
+            shape: [1, 3, Constants.sideLength, Constants.sideLength]
         )
     }
     #endif

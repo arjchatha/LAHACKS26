@@ -23,7 +23,6 @@ final class CameraManager: NSObject, ObservableObject {
     let previewLayer = AVCaptureVideoPreviewLayer()
 
     @Published private(set) var state: CameraState = .idle
-    @Published private(set) var latestPixelBuffer: CVPixelBuffer?
     @Published private(set) var isUsingFrontCamera = false
 
     var onFrame: ((CVPixelBuffer, Bool) -> Void)?
@@ -102,10 +101,10 @@ final class CameraManager: NSObject, ObservableObject {
         }
 
         isUsingFrontCamera = false
+        configureFrameRate(camera, framesPerSecond: 24)
+
         session.beginConfiguration()
-        if session.canSetSessionPreset(.hd1920x1080) {
-            session.sessionPreset = .hd1920x1080
-        } else if session.canSetSessionPreset(.hd1280x720) {
+        if session.canSetSessionPreset(.hd1280x720) {
             session.sessionPreset = .hd1280x720
         } else {
             session.sessionPreset = .high
@@ -154,6 +153,19 @@ final class CameraManager: NSObject, ObservableObject {
         ).devices.first
     }
 
+    private func configureFrameRate(_ camera: AVCaptureDevice, framesPerSecond: Int32) {
+        do {
+            try camera.lockForConfiguration()
+            defer { camera.unlockForConfiguration() }
+
+            let frameDuration = CMTime(value: 1, timescale: framesPerSecond)
+            camera.activeVideoMinFrameDuration = frameDuration
+            camera.activeVideoMaxFrameDuration = frameDuration
+        } catch {
+            return
+        }
+    }
+
     private func configure(connection: AVCaptureConnection, mirrored: Bool) {
         if #available(iOS 17.0, *) {
             let portraitRotationAngle: CGFloat = 90
@@ -186,7 +198,6 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate {
         Task { @MainActor [weak self] in
             guard let self else { return }
 
-            self.latestPixelBuffer = sendablePixelBuffer.value
             self.onFrame?(sendablePixelBuffer.value, self.isUsingFrontCamera)
         }
     }

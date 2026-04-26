@@ -16,7 +16,7 @@ protocol MemoryBridge: AnyObject {
     func recognizeApprovedPerson(faceProfileId: String) -> String
     func profileDisplay(for faceProfileId: String) -> PersonProfileDisplayResult
     func approvedProfileDisplays() -> [PersonProfileDisplay]
-    func recognizedFaceProfileId(for detection: FaceDetectionResult, in pixelBuffer: CVPixelBuffer) -> String?
+    func faceRecognitionDecision(for detection: FaceDetectionResult, in pixelBuffer: CVPixelBuffer) -> FaceRecognitionDecision?
     func approvePersonEnrollment(personId: String, caregiverName: String)
 }
 
@@ -141,11 +141,12 @@ final class MockMemoryBridge: ObservableObject, MemoryBridge {
             }
     }
 
-    func recognizedFaceProfileId(for detection: FaceDetectionResult, in pixelBuffer: CVPixelBuffer) -> String? {
+    func faceRecognitionDecision(for detection: FaceDetectionResult, in pixelBuffer: CVPixelBuffer) -> FaceRecognitionDecision? {
         guard detection.hasFace, detection.confidence >= 0.28 else { return nil }
 
         if let faceProfileId = detection.faceProfileId, approvedFaceProfileIds.contains(faceProfileId) {
-            return faceProfileId
+            let match = FaceRecognitionMatch(faceProfileId: faceProfileId, similarity: Float(detection.confidence))
+            return FaceRecognitionDecision(acceptedMatch: match, bestCandidate: match)
         }
 
         guard
@@ -160,7 +161,7 @@ final class MockMemoryBridge: ObservableObject, MemoryBridge {
             FaceEmbeddingCandidate(faceProfileId: faceProfileId, embedding: embedding)
         }
 
-        return faceRecognitionService.bestMatch(for: embedding, candidates: candidates)?.faceProfileId
+        return faceRecognitionService.recognitionDecision(for: embedding, candidates: candidates)
     }
 
     @discardableResult
@@ -179,18 +180,31 @@ final class MockMemoryBridge: ObservableObject, MemoryBridge {
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
 
-        let personId = "person-photo-\(UUID().uuidString.prefix(8))"
-        let faceProfileId = "face-photo-\(UUID().uuidString.prefix(8))"
-        let storedPhotoURLs = try storeProfilePhotos(sourceImages: sourceImages, personId: personId)
         guard let faceRecognitionService else {
             throw FaceRecognitionError.embeddingModelUnavailable("The face embedding model is not available.")
         }
 
-        let embedding = try faceRecognitionService.enrollmentEmbedding(fromImages: sourceImages)
-        guard !embedding.isEmpty, embedding.allSatisfy(\.isFinite) else {
-            try? removeStoredProfilePhotos(at: storedPhotoURLs)
+        let newFaceEmbedding = try faceRecognitionService.enrollmentEmbedding(fromImages: sourceImages)
+        guard !newFaceEmbedding.isEmpty, newFaceEmbedding.allSatisfy(\.isFinite) else {
             throw ProfilePhotoStorageError.invalidEmbeddingData
         }
+
+        if let existingIndex = existingPhotoProfileIndex(matching: cleanName) {
+            return try updateExistingPhotoProfile(
+                at: existingIndex,
+                name: cleanName,
+                relationship: cleanRelationship,
+                memoryCue: cleanMemoryCue,
+                didEnterMemoryCue: !enteredMemoryCue.isEmpty,
+                detailLines: cleanDetailLines,
+                sourceImages: sourceImages,
+                newFaceEmbedding: newFaceEmbedding
+            )
+        }
+
+        let personId = "person-photo-\(UUID().uuidString.prefix(8))"
+        let faceProfileId = "face-photo-\(UUID().uuidString.prefix(8))"
+        let storedPhotoURLs = try appendProfilePhotos(sourceImages: sourceImages, personId: personId)
         let profile = PersonProfileDisplay(
             personId: personId,
             faceProfileId: faceProfileId,
@@ -203,12 +217,12 @@ final class MockMemoryBridge: ObservableObject, MemoryBridge {
 
         approvedFaceProfileIds.insert(faceProfileId)
         approvedProfilesByFaceProfileId[faceProfileId] = profile
-        embeddingsByFaceProfileId[faceProfileId] = embedding
+        embeddingsByFaceProfileId[faceProfileId] = newFaceEmbedding
         enrolledPhotoProfiles.append(
             StoredPersonPhotoProfile(
                 profile: profile,
                 photoURLs: storedPhotoURLs,
-                embedding: embedding,
+                embedding: newFaceEmbedding,
                 createdAt: Date()
             )
         )
@@ -247,27 +261,75 @@ final class MockMemoryBridge: ObservableObject, MemoryBridge {
         approvedFaceProfileIds.insert(DemoPerson.mayaFaceProfileId)
     }
 
-    private func storeProfilePhotos(sourceImages: [UIImage], personId: String) throws -> [URL] {
+    private func updateExistingPhotoProfile(
+        at index: Int,
+        name: String,
+        relationship: String,
+        memoryCue: String,
+        didEnterMemoryCue: Bool,
+        detailLines: [String],
+        sourceImages: [UIImage],
+        newFaceEmbedding: [Float]
+    ) throws -> PersonProfileDisplay {
+        let storedProfile = enrolledPhotoProfiles[index]
+        let profile = storedProfile.profile
+        let faceProfileId = profile.faceProfileId
+        let appendedPhotoURLs = try appendProfilePhotos(sourceImages: sourceImages, personId: profile.personId)
+        let previousFaceEmbedding = embeddingsByFaceProfileId[faceProfileId] ?? storedProfile.embedding
+        let updatedFaceEmbedding = weightedAverageEmbedding(
+            previousFaceEmbedding,
+            existingWeight: Float(storedProfile.photoURLs.count),
+            newFaceEmbedding,
+            newWeight: Float(appendedPhotoURLs.count)
+        )
+        let updatedProfile = PersonProfileDisplay(
+            personId: profile.personId,
+            faceProfileId: faceProfileId,
+            name: name,
+            relationship: relationship.isEmpty ? profile.relationship : relationship,
+            memoryCue: didEnterMemoryCue ? memoryCue : profile.memoryCue,
+            detailLines: detailLines.isEmpty ? profile.detailLines : detailLines,
+            caregiverApproved: profile.caregiverApproved
+        )
+        let updatedStoredProfile = StoredPersonPhotoProfile(
+            profile: updatedProfile,
+            photoURLs: storedProfile.photoURLs + appendedPhotoURLs,
+            embedding: updatedFaceEmbedding,
+            createdAt: storedProfile.createdAt
+        )
+
+        enrolledPhotoProfiles[index] = updatedStoredProfile
+        approvedFaceProfileIds.insert(faceProfileId)
+        approvedProfilesByFaceProfileId[faceProfileId] = updatedProfile
+        embeddingsByFaceProfileId[faceProfileId] = updatedFaceEmbedding
+
+        do {
+            try saveStoredPhotoProfiles()
+        } catch {
+            enrolledPhotoProfiles[index] = storedProfile
+            approvedProfilesByFaceProfileId[faceProfileId] = profile
+            embeddingsByFaceProfileId[faceProfileId] = previousFaceEmbedding
+            try? removeStoredProfilePhotos(at: appendedPhotoURLs)
+            throw error
+        }
+
+        return updatedProfile
+    }
+
+    private func appendProfilePhotos(sourceImages: [UIImage], personId: String) throws -> [URL] {
         let directoryURL = try profilePhotoDirectoryURL()
         let profileDirectoryURL = directoryURL.appendingPathComponent(personId, isDirectory: true)
         try FileManager.default.createDirectory(at: profileDirectoryURL, withIntermediateDirectories: true)
 
-        if let existingFiles = try? FileManager.default.contentsOfDirectory(
-            at: profileDirectoryURL,
-            includingPropertiesForKeys: nil
-        ) {
-            for fileURL in existingFiles {
-                try? FileManager.default.removeItem(at: fileURL)
-            }
-        }
-
         var storedURLs: [URL] = []
+        var nextPhotoIndex = nextAvailablePhotoIndex(in: profileDirectoryURL)
 
-        for (index, image) in sourceImages.enumerated() {
+        for image in sourceImages {
             guard let imageData = image.jpegData(compressionQuality: 0.92) else { continue }
-            let destinationURL = profileDirectoryURL.appendingPathComponent("photo-\(index + 1).jpg")
+            let destinationURL = profileDirectoryURL.appendingPathComponent("photo-\(nextPhotoIndex).jpg")
             try imageData.write(to: destinationURL, options: [.atomic])
             storedURLs.append(destinationURL)
+            nextPhotoIndex += 1
         }
 
         return storedURLs
@@ -299,6 +361,55 @@ final class MockMemoryBridge: ObservableObject, MemoryBridge {
             approvedProfilesByFaceProfileId[faceProfileId] = storedProfile.profile
             embeddingsByFaceProfileId[faceProfileId] = storedProfile.embedding
         }
+    }
+
+    private func existingPhotoProfileIndex(matching name: String) -> Int? {
+        let foldedName = name.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+
+        return enrolledPhotoProfiles.firstIndex { storedProfile in
+            storedProfile.profile.name
+                .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current) == foldedName
+        }
+    }
+
+    private func nextAvailablePhotoIndex(in directoryURL: URL) -> Int {
+        guard
+            let fileURLs = try? FileManager.default.contentsOfDirectory(
+                at: directoryURL,
+                includingPropertiesForKeys: nil
+            )
+        else {
+            return 1
+        }
+
+        let existingIndices = fileURLs.compactMap { fileURL -> Int? in
+            let name = fileURL.deletingPathExtension().lastPathComponent
+            guard name.hasPrefix("photo-") else { return nil }
+            return Int(name.dropFirst("photo-".count))
+        }
+
+        return (existingIndices.max() ?? 0) + 1
+    }
+
+    private func weightedAverageEmbedding(
+        _ existing: [Float],
+        existingWeight: Float,
+        _ new: [Float],
+        newWeight: Float
+    ) -> [Float] {
+        guard existing.count == new.count, !existing.isEmpty else {
+            return FaceEmbeddingMath.l2Normalized(new.isEmpty ? existing : new)
+        }
+
+        let clampedExistingWeight = max(0, existingWeight)
+        let clampedNewWeight = max(0, newWeight)
+        let totalWeight = clampedExistingWeight + clampedNewWeight
+        guard totalWeight > 0 else { return FaceEmbeddingMath.l2Normalized(new) }
+
+        let merged = zip(existing, new).map { existingValue, newValue in
+            ((existingValue * clampedExistingWeight) + (newValue * clampedNewWeight)) / totalWeight
+        }
+        return FaceEmbeddingMath.l2Normalized(merged)
     }
 
     private func saveStoredPhotoProfiles() throws {

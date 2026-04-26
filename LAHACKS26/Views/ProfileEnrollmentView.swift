@@ -136,7 +136,7 @@ struct ProfileEnrollmentView: View {
                                         .font(.subheadline)
                                         .foregroundStyle(.secondary)
                                 }
-                                Text("\(storedProfile.photoURLs.count) photo(s)")
+                                Text(savedProfileSummary(storedProfile))
                                     .font(.caption)
                                     .foregroundStyle(.tertiary)
                             }
@@ -156,7 +156,7 @@ struct ProfileEnrollmentView: View {
         }
         .sheet(isPresented: $isShowingCamera) {
             PhotoCameraPicker(
-                photoCount: Constants.requiredPhotoCount,
+                photoCount: remainingPhotoCount,
                 captureInterval: 0.1,
                 onPhotosCaptured: { images in
                     appendSelectedImages(images, sourceDescription: "camera")
@@ -184,34 +184,24 @@ struct ProfileEnrollmentView: View {
     private func startCameraCapture() {
         guard !isProcessingEnrollment else { return }
 
-        guard !trimmedName.isEmpty else {
-            statusMessage = "Add the person's name before taking photos."
-            return
-        }
-
         guard PhotoCameraPicker.isCameraAvailable else {
             statusMessage = "Photo capture is not available here. Run the app on a physical iPhone."
             return
         }
 
-        statusMessage = nil
+        statusMessage = "Opening back camera..."
         isShowingCamera = true
     }
 
     private func startPhotoLibrary() {
         guard !isProcessingEnrollment else { return }
 
-        guard !trimmedName.isEmpty else {
-            statusMessage = "Add the person's name before selecting photos."
-            return
-        }
-
         guard PhotoLibraryPicker.isPhotoLibraryAvailable else {
             statusMessage = "Photo library access is not available here."
             return
         }
 
-        statusMessage = nil
+        statusMessage = "Opening photo library..."
         isShowingPhotoLibrary = true
     }
 
@@ -222,7 +212,7 @@ struct ProfileEnrollmentView: View {
         }
 
         isProcessingEnrollment = true
-        statusMessage = "Building face profile from \(Constants.requiredPhotoCount) photos."
+        statusMessage = "Building face profile."
 
         Task {
             await Task.yield()
@@ -279,6 +269,10 @@ struct ProfileEnrollmentView: View {
 
     private var progressText: String {
         "\(selectedImages.count)/\(Constants.requiredPhotoCount) photos ready"
+    }
+
+    private func savedProfileSummary(_ storedProfile: StoredPersonPhotoProfile) -> String {
+        "\(storedProfile.photoURLs.count) photo(s)"
     }
 }
 
@@ -736,12 +730,12 @@ private enum AutoPhotoCaptureError: LocalizedError {
         switch self {
         case .noCamera:
             #if targetEnvironment(simulator)
-            "The iPhone Simulator is not exposing a rear camera. Run on a physical iPhone for automatic capture."
+            "The iPhone Simulator is not exposing a back camera. Run on a physical iPhone for automatic capture."
             #else
-            "The rear camera is not available on this device."
+            "The back camera is not available on this device."
             #endif
         case .cannotAddInput:
-            "The app could not connect to the rear camera."
+            "The app could not connect to the back camera."
         case .cannotAddOutput:
             "The app could not read camera frames for automatic capture."
         }
