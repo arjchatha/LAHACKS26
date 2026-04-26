@@ -1,307 +1,819 @@
-# MindAnchor Agent Instructions
 
-## Product Direction
+# MindAnchor Agent Instructions — Focused Person Memory Demo
 
-MindAnchor is a privacy-first, local memory companion for people with early memory loss.
+## Product Summary
 
-The current implementation is a TypeScript, in-memory backend for a local memory wiki. It supports voice-first Patient Mode, caregiver-reviewed memory editing, and a mocked local person enrollment pipeline.
+MindAnchor is a privacy-first memory companion for people with early memory loss.
 
-Keep the product centered on this principle:
+This prototype is focused on one clear demo:
 
-- Patient Mode is a calm voice assistant.
-- Caregiver Mode is the trusted review and editing surface.
+> The patient meets someone they do not remember. MindAnchor listens to the conversation, extracts who the person is, stores a draft memory page, asks the caregiver to approve it, and later recognizes the same person to remind the patient who they are.
+
+Core principle:
+
+- Patient Mode is calm and voice-first.
+- Caregiver Mode is the trusted review and approval surface.
 - The memory wiki is the private local source of truth.
-- Future on-device models provide senses such as speech, object detection, and face recognition.
+- Face/speech model outputs are treated as local evidence.
+- Identity is never shown as trusted until caregiver approval.
 
-## Current Scope
+This is a quick hackathon prototype. Keep it simple, local, and demo-ready.
 
-This repo currently implements only the local backend layer.
+---
+
+## Current Prototype Scope
+
+The current demo should focus on:
+
+1. Person learning from conversation
+2. Draft person memory creation
+3. Caregiver approval
+4. Later recognition using a mocked local face profile ID
+5. A readable memory wiki page for the learned person
+
+Allowed:
+
+- SwiftUI frontend
+- Local Swift mock memory store / memory bridge
+- Conversation transcript input or simulated speech transcript
+- Mock face profile ID, such as `face-maya-001`
+- Apple Vision face detection bounding boxes if already available
+- ZETIC/Melange adapter stubs if useful
+- Text-to-speech for patient-facing responses
+- Caregiver approval UI
+- Memory wiki demo view
 
 Do not add unless explicitly requested:
 
-- Frontend UI
-- Database
-- Express/API server
-- Real ZETIC integration
-- Real speech recognition
-- Real face recognition
 - Cloud sync
 - Authentication
-- Medical diagnosis or medical claims
+- Production database
+- Medical diagnosis claims
+- Emergency dispatch
+- Full dementia assessment
+- Large unrelated features like object recall, medication tracking, or full daily planning
+- Real biometric identity claims without caregiver approval
 
-Everything should remain local, mocked where needed, and runnable with:
+Everything should remain local/in-memory unless explicitly requested otherwise.
 
-```bash
-npm run typecheck
-npm run demo
+---
+
+## Main Demo Flow
+
+The demo should show this exact story:
+
+### Scene 1: First Conversation
+
+Patient is talking to a person they do not know.
+
+Transcript:
+
+```txt
+Hi, I'm Maya. I'm your neighbor from next door. I usually help bring in your mail.
+````
+
+MindAnchor extracts:
+
+* Name: Maya
+* Relationship: neighbor from next door
+* Helpful context: usually helps bring in your mail
+* Face profile ID: `face-maya-001`
+
+MindAnchor creates a draft person memory.
+
+Patient-facing response before approval:
+
+```txt
+I learned a possible new person. A caregiver needs to approve this memory before I identify them for you.
 ```
 
-## Project Structure
+---
 
-Core backend files:
+### Scene 2: Caregiver Review
 
-- `src/memory/types.ts`
-- `src/memory/seedData.ts`
-- `src/memory/MemoryStore.ts`
-- `src/memory/memoryService.ts`
-- `src/memory/markdownExport.ts`
-- `src/demo/runDemo.ts`
+Caregiver sees a draft card:
 
-`MemoryStore` owns in-memory state and product logic.
-
-`memoryService` is the frontend-friendly facade. Future UI work should import from this layer rather than reaching into store internals.
-
-`markdownExport` is for caregiver/demo visibility only. Patients should not see raw wiki markdown.
-
-## Trust Model
-
-Use these trust levels:
-
-- `caregiverApproved`: high trust. Use for people, medication routines, appointments, and safety-critical facts.
-- `aiObserved`: medium trust. Use for object sightings, mocked model outputs, face profiles, and transcript extraction.
-- `patientReported`: contextual trust. Useful as a clue, but it must not override safety-critical caregiver-approved facts.
-
-Safety rules:
-
-- Do not automatically accept patient-reported medication changes.
-- Do not identify unapproved people as trusted.
-- Do not expose detailed wiki pages in Patient Mode.
-- Prefer short, calm, patient-safe responses.
-- Caregiver-approved facts override AI-observed and patient-reported facts.
-
-## Voice-First Patient Mode
-
-Patient Mode is transcript-driven. The frontend should send local speech-to-text transcripts into:
-
-```ts
-processPatientSpeech(transcript: string)
+```txt
+Maya
+Possible relationship: neighbor from next door
+Helpful context: helps bring in your mail
+Evidence: conversation transcript
+Face profile: face-maya-001
+Status: Needs approval
 ```
 
-The backend returns `PatientSpeechResult`:
+Caregiver taps:
 
-- `transcript`
-- `intent`
-- `spokenResponse`
-- `displayText`
-- `needsCaregiverReview`
-- `relatedMemoryIds`
+```txt
+Approve
+```
 
-Supported patient speech intents:
+The person becomes approved for recognition.
 
-- `objectLocation`
-- `confusion`
-- `personIdentity`
-- `routineStatus`
-- `unknown`
+---
 
-Current routing expectations:
+### Scene 3: Later Recognition
 
-- "Where are my keys?" routes to object location memory.
-- "Where are my glasses?" routes to object location memory.
-- "I forgot where I'm going" routes to confusion support.
-- "I feel lost" routes to confusion support.
-- "Did I take my medicine?" routes to routine status.
-- "Who is this?" returns a safe response unless an approved face/person context exists.
+Patient meets the same person again.
 
-Responses should be suitable for text-to-speech. `displayText` should be short enough for a minimal overlay.
+The app receives or simulates:
 
-Speech interactions should be logged as events so caregivers can review what happened.
+```txt
+faceProfileId = face-maya-001
+```
 
-## Memory Models
+If Maya is approved, the app speaks/displays:
 
-The wiki stores:
+```txt
+This is Maya, your neighbor from next door. She helps bring in your mail.
+```
 
-- People
-- Objects
-- Routines
-- Places
-- Events
-- Daily summaries
-- Person enrollment sessions
+If Maya is not approved yet, the app must say:
 
-Memory entries should include:
+```txt
+I see someone nearby, but I do not have a caregiver-approved identity for them yet.
+```
 
-- `id`
-- `type`
-- `createdAt`
-- `updatedAt`
-- `trustLevel`
-- `source`
-- `notes`
-- optional `caregiverApproved`
-- optional `confidence`
+---
 
-People can also include:
+## Product Safety Rules
 
-- `recognitionStatus`
-- `faceProfileId`
-- `needsCaregiverReview`
-- `evidenceNotes`
-- `status`
+Never identify a person as trusted before caregiver approval.
 
-## Seed Data
+Do not say:
 
-Keep demo seed data for:
+```txt
+This is Maya.
+```
 
-- Anita: daughter and caregiver
-- Rahul: grandson
-- Keys: usually near the front door
-- Glasses: usually on the bedroom nightstand
-- Medicine Box: kitchen counter
-- Morning Medication: 8:00 AM
-- Doctor Appointment: 3:30 PM, Anita picks patient up at 3:15 PM
-- Kitchen
-- Bedroom
-- Front door
-- Doctor clinic
+unless:
 
-## MemoryStore Responsibilities
+* the person memory is approved
+* caregiverApproved is true
+* recognitionStatus is approvedForRecognition
 
-`MemoryStore` should continue to provide:
+Before approval, say:
 
-- `updateObjectLastSeen`
-- `answerWhereIsObject`
-- `answerConfusionPhrase`
-- `answerWhoIsPerson`
-- `logRoutineCompleted`
-- `addPatientReportedMemory`
-- `correctObjectMemory`
-- `generateDailySummary`
-- `exportMarkdownWiki`
-- `getSnapshot`
-- `processPatientSpeech`
+```txt
+I see someone nearby, but I do not have a caregiver-approved identity for them yet.
+```
 
-Person enrollment methods:
+Do not make medical claims.
 
-- `startPersonEnrollmentSession`
-- `addEnrollmentTranscript`
-- `attachEnrollmentFaceProfile`
-- `createDraftPersonFromEnrollment`
-- `approvePersonEnrollment`
-- `rejectPersonEnrollment`
-- `recognizeApprovedPerson`
+Do not say:
 
-`generateDailySummary` should return caregiver-friendly bullet items, not a compressed stats sentence.
+* “You are having a dementia episode.”
+* “This proves memory decline.”
+* “This person is safe” before caregiver approval.
+* “You can trust this person” unless caregiver approved.
 
-Timestamps shown in dashboard, markdown, and summaries should be readable local times, not raw ISO strings.
+Patient-facing language should be:
 
-## Person Enrollment Pipeline
+* short
+* calm
+* spoken clearly
+* non-clinical
+* reassuring
 
-The current enrollment flow is local and mocked:
+---
 
-1. Patient talks to someone.
-2. Local speech transcript is added to an enrollment session.
-3. Simple extraction rules infer possible name and relationship.
-4. A mocked local face profile id is attached.
-5. A draft `PersonMemory` is created.
-6. Caregiver reviews and approves or rejects.
-7. Recognition only identifies the person after caregiver approval.
+## Memory Wiki Concept
+
+The memory wiki is the local source of truth.
+
+For this focused demo, the wiki only needs to store:
+
+* People
+* Conversation evidence
+* Face profile IDs
+* Approval state
+* Recognition state
+
+The patient should not see raw markdown.
+
+The caregiver/demo view can show a readable “memory wiki” page.
+
+Example draft page:
+
+```md
+# Maya
+
+Status: Draft
+Caregiver Approved: false
+Recognition Status: unverified
+Trust Level: aiObserved
+Needs Caregiver Review: true
+
+## Extracted Information
+
+Name: Maya
+Relationship: neighbor from next door
+Helpful context: helps bring in your mail
+
+## Evidence
+
+Transcript:
+“Hi, I'm Maya. I'm your neighbor from next door. I usually help bring in your mail.”
+
+Face profile ID:
+face-maya-001
+
+## Safety
+
+Do not identify this person to the patient until caregiver approval.
+```
+
+Example approved page:
+
+```md
+# Maya
+
+Status: Approved
+Caregiver Approved: true
+Recognition Status: approvedForRecognition
+Trust Level: caregiverApproved
+
+## Relationship
+
+Neighbor from next door.
+
+## Helpful Context
+
+Maya usually helps bring in the mail.
+
+## Patient Prompt
+
+This is Maya, your neighbor from next door. She helps bring in your mail.
+
+## Evidence
+
+Originally introduced in conversation.
+Approved by caregiver.
+Face profile ID: face-maya-001
+```
+
+---
+
+## Data Model
+
+Create or maintain a person memory model like:
+
+```swift
+struct PersonMemory: Identifiable {
+    let id: String
+    var name: String
+    var relationship: String
+    var helpfulContext: String
+    var patientPrompt: String
+    var transcriptEvidence: [String]
+    var faceProfileId: String?
+    var voiceProfileId: String?
+    var status: PersonStatus
+    var caregiverApproved: Bool
+    var recognitionStatus: RecognitionStatus
+    var trustLevel: TrustLevel
+    var createdAt: Date
+    var updatedAt: Date
+}
+```
+
+Suggested enums:
+
+```swift
+enum PersonStatus {
+    case draft
+    case approved
+    case rejected
+}
+
+enum RecognitionStatus {
+    case unverified
+    case approvedForRecognition
+}
+
+enum TrustLevel {
+    case caregiverApproved
+    case aiObserved
+    case patientReported
+}
+```
+
+Enrollment session model:
+
+```swift
+struct PersonEnrollmentSession: Identifiable {
+    let id: String
+    var transcript: String
+    var extractedName: String?
+    var extractedRelationship: String?
+    var extractedHelpfulContext: String?
+    var faceProfileId: String?
+    var faceConfidence: Double?
+    var draftPersonId: String?
+    var status: EnrollmentStatus
+    var createdAt: Date
+    var updatedAt: Date
+}
+```
+
+Suggested enum:
+
+```swift
+enum EnrollmentStatus {
+    case collectingEvidence
+    case draftCreated
+    case caregiverReview
+    case approved
+    case rejected
+}
+```
+
+---
+
+## Required Memory Bridge
+
+If this branch is SwiftUI-only, implement a local Swift memory bridge.
+
+Use a protocol like:
+
+```swift
+protocol MemoryBridge {
+    func startPersonEnrollmentSession() -> String
+
+    func addConversationTranscript(
+        sessionId: String,
+        transcript: String
+    )
+
+    func attachFaceProfile(
+        sessionId: String,
+        faceProfileId: String,
+        confidence: Double
+    )
+
+    func createDraftPersonMemory(
+        sessionId: String
+    ) -> String?
+
+    func approvePerson(
+        personId: String,
+        caregiverName: String
+    )
+
+    func rejectPerson(
+        personId: String,
+        caregiverName: String
+    )
+
+    func recognizePersonByFaceProfile(
+        faceProfileId: String
+    ) -> PatientRecognitionResult
+
+    func getCaregiverReviewQueue() -> [PersonMemory]
+
+    func getPersonWikiPage(
+        personId: String
+    ) -> String
+}
+```
+
+Result model:
+
+```swift
+struct PatientRecognitionResult {
+    let spokenResponse: String
+    let displayText: String
+    let recognizedPersonId: String?
+    let caregiverApproved: Bool
+}
+```
+
+Implement `MockMemoryBridge` locally for the demo.
+
+---
+
+## Required Functions
+
+The app should support these operations:
+
+### 1. Start Enrollment
+
+```swift
+let sessionId = memoryBridge.startPersonEnrollmentSession()
+```
+
+Creates a new person enrollment session.
+
+---
+
+### 2. Add Conversation Transcript
+
+```swift
+memoryBridge.addConversationTranscript(
+    sessionId: sessionId,
+    transcript: "Hi, I'm Maya. I'm your neighbor from next door. I usually help bring in your mail."
+)
+```
+
+For the MVP, extraction can be rule-based.
+
+It should detect:
+
+* `I'm Maya`
+* `my name is Maya`
+* `I'm your neighbor`
+* `neighbor from next door`
+* `help bring in your mail`
+
+Expected extraction:
+
+```txt
+Name: Maya
+Relationship: neighbor from next door
+Helpful context: helps bring in your mail
+```
+
+No real LLM is required for this prototype, but the logic should be shaped so a future LLM extractor can replace the rules.
+
+---
+
+### 3. Attach Face Profile
+
+```swift
+memoryBridge.attachFaceProfile(
+    sessionId: sessionId,
+    faceProfileId: "face-maya-001",
+    confidence: 0.88
+)
+```
+
+For MVP, the face profile ID can be mocked.
+
+If Apple Vision/ZETIC face detection exists, use it only to detect a face and trigger profile capture. Do not claim real biometric recognition unless implemented.
+
+---
+
+### 4. Create Draft Person
+
+```swift
+let personId = memoryBridge.createDraftPersonMemory(sessionId: sessionId)
+```
+
+Creates draft `PersonMemory`.
 
 Draft person memory must use:
 
-- `trustLevel: "aiObserved"`
-- `caregiverApproved: false`
-- `trustedSupport: false`
-- `recognitionStatus: "unverified"`
-- `needsCaregiverReview: true`
-- `status: "draft"`
-- evidence notes from transcript and face profile data
+* `status: .draft`
+* `trustLevel: .aiObserved`
+* `caregiverApproved: false`
+* `recognitionStatus: .unverified`
+
+---
+
+### 5. Approve Person
+
+```swift
+memoryBridge.approvePerson(
+    personId: personId,
+    caregiverName: "Anita"
+)
+```
 
 Approved person memory must use:
 
-- `trustLevel: "caregiverApproved"`
-- `caregiverApproved: true`
-- `trustedSupport: true`
-- `recognitionStatus: "approvedForRecognition"`
-- `status: "approved"`
+* `status: .approved`
+* `trustLevel: .caregiverApproved`
+* `caregiverApproved: true`
+* `recognitionStatus: .approvedForRecognition`
 
-Rejected people must not be recognized as trusted.
+---
 
-`recognizeApprovedPerson(faceProfileId)` must only identify people who are caregiver-approved and approved for recognition. Otherwise it must return a safe unknown/unapproved response.
+### 6. Recognize Later
 
-## memoryService Contract
+```swift
+let result = memoryBridge.recognizePersonByFaceProfile(
+    faceProfileId: "face-maya-001"
+)
+```
 
-Keep these stable frontend-facing functions:
+If approved, return:
 
-- `getPatientHome`
-- `detectObject`
-- `askWhereIsObject`
-- `reportConfusion`
-- `completeRoutine`
-- `correctObject`
-- `getCaregiverDashboard`
-- `getMarkdownWiki`
-- `processPatientSpeech`
+```txt
+This is Maya, your neighbor from next door. She helps bring in your mail.
+```
 
-Enrollment-facing service functions:
+If not approved, return:
 
-- `startPersonEnrollmentSession`
-- `addEnrollmentTranscript`
-- `attachEnrollmentFaceProfile`
-- `createDraftPersonFromEnrollment`
-- `approvePersonEnrollment`
-- `rejectPersonEnrollment`
-- `recognizeApprovedPerson`
+```txt
+I see someone nearby, but I do not have a caregiver-approved identity for them yet.
+```
 
-Return typed view models from `memoryService`, not raw internal state when a frontend-friendly shape is more appropriate.
+---
 
-`getCaregiverDashboard()` should include:
+## Frontend Screens
 
-- daily summary
-- review events
-- recent events
-- objects
-- routines
-- `needsReview.draftPeople`
-- `needsReview.enrollmentSessions`
-- `needsReview.events`
+Build the frontend around three simple screens or sections.
 
-## Markdown Export
+### 1. Conversation Capture Screen
 
-Markdown export is for caregiver/demo inspection.
+Purpose:
 
-It should include sections for:
+* Simulate or capture the first conversation.
+* Extract person information.
+* Create a draft memory.
 
-- People
-- Objects
-- Routines
-- Places
-- Events
-- Daily Summary
+Should include:
 
-Draft or unapproved people must clearly show:
+* camera preview or camera placeholder
+* transcript input or demo transcript button
+* extracted info preview
+* button: “Create Draft Memory”
+* status message: “Needs caregiver approval”
 
-- Status
-- Caregiver approved
-- Recognition status
-- Needs caregiver review
-- Face profile id when present
-- Evidence notes
+Demo transcript button should insert:
 
-## Demo Expectations
+```txt
+Hi, I'm Maya. I'm your neighbor from next door. I usually help bring in your mail.
+```
 
-`src/demo/runDemo.ts` should exercise the main local flows:
+---
 
-- Object detection for keys near kitchen counter
-- Voice-first patient speech:
-  - "Where are my keys?"
-  - "I forgot where I'm going"
-  - "Did I take my medicine?"
-  - "Who is this?"
-- Caregiver object correction
-- Person enrollment for Maya
-- Recognition blocked before approval
-- Anita approves Maya
-- Recognition succeeds after approval
-- Caregiver dashboard output
-- Markdown wiki export
+### 2. Caregiver Review Screen
+
+Purpose:
+
+* Show draft person memories.
+* Approve or reject them.
+
+Should include:
+
+* draft person card
+* name
+* relationship
+* helpful context
+* transcript evidence
+* face profile ID
+* approve button
+* reject button
+
+---
+
+### 3. Later Recognition Screen
+
+Purpose:
+
+* Simulate the later conversation.
+* Recognize the same local face profile.
+* Retrieve the approved person memory.
+
+Should include:
+
+* camera preview or placeholder
+* button: “Simulate Maya recognized”
+* patient-facing response overlay
+* text-to-speech response if available
+
+Before approval, this screen should return the safe unapproved response.
+
+After approval, it should return Maya’s approved prompt.
+
+---
+
+### 4. Memory Wiki View
+
+Purpose:
+
+* Show the generated person wiki page.
+* Make the LLM wiki idea visible to judges.
+
+Should show:
+
+* draft wiki page before approval
+* approved wiki page after approval
+* transcript evidence
+* face profile ID
+* approval state
+* recognition state
+
+This view is caregiver/demo-facing only.
+
+---
+
+## Camera / Face Detection Direction
+
+For the quick demo, face recognition can be mocked.
+
+Minimum:
+
+* Use a camera preview or placeholder.
+* Use Apple Vision face detection if already available.
+* Draw a polished face bounding box if a face is detected.
+* Create a mocked face profile ID when the user taps a demo button.
+
+Preferred first technical milestone:
+
+```txt
+Rear camera feed
+→ Apple Vision face detection bounding box
+→ mocked faceProfileId
+→ enrollment session
+→ caregiver approval
+→ later recognition by same faceProfileId
+```
+
+Important:
+
+* Face detection is not face recognition.
+* Do not claim actual identity matching unless implemented.
+* The mock `faceProfileId` is acceptable for hackathon demo if clearly framed as a local profile placeholder.
+
+---
+
+## UI Style
+
+The app should feel native iOS, not like a debug screen.
+
+Use:
+
+* SwiftUI
+* translucent materials
+* rounded cards
+* capsules
+* SF Symbols
+* soft shadows
+* calm spacing
+* simple typography
+
+Avoid:
+
+* harsh debug rectangles
+* crowded buttons
+* raw JSON
+* raw logs
+* long text in patient mode
+* neon green debug boxes unless in debug mode
+
+Patient-facing UI should be minimal.
+
+Caregiver/demo UI can show more details.
+
+---
+
+## Text-to-Speech
+
+If implemented, use `AVSpeechSynthesizer`.
+
+Create a small service like:
+
+```swift
+final class TextToSpeechService {
+    func speak(_ text: String) {
+        // AVSpeechSynthesizer implementation
+    }
+}
+```
+
+Use it when recognition returns a patient-facing prompt.
+
+Speech should be calm and not too fast.
+
+---
+
+## Demo Buttons
+
+For reliability, include demo buttons.
+
+Suggested buttons:
+
+Conversation Capture:
+
+* “Use Maya Transcript”
+* “Attach Face Profile”
+* “Create Draft Memory”
+
+Caregiver Review:
+
+* “Approve Maya”
+* “Reject Maya”
+
+Later Recognition:
+
+* “Simulate Maya Recognized”
+* “Ask Who Is This?”
+
+Memory Wiki:
+
+* “Show Draft Wiki”
+* “Show Approved Wiki”
+
+---
+
+## Required Demo Script
+
+The app should support this sequence:
+
+1. Open Conversation Capture.
+2. Tap “Use Maya Transcript.”
+3. Tap “Attach Face Profile.”
+4. Tap “Create Draft Memory.”
+5. Show draft wiki page:
+
+   * Maya
+   * neighbor from next door
+   * helps bring in mail
+   * caregiver approved: false
+6. Go to Later Recognition.
+7. Tap “Simulate Maya Recognized” before approval.
+8. App says:
+
+   * “I see someone nearby, but I do not have a caregiver-approved identity for them yet.”
+9. Go to Caregiver Review.
+10. Tap “Approve Maya.”
+11. Go back to Later Recognition.
+12. Tap “Simulate Maya Recognized.”
+13. App says:
+
+* “This is Maya, your neighbor from next door. She helps bring in your mail.”
+
+14. Show approved wiki page.
+
+---
+
+## ZETIC/Melange Direction
+
+ZETIC/Melange is part of the final sponsor story, but this focused demo can mock model outputs if needed.
+
+Use this explanation:
+
+* Speech model transcribes the conversation on-device.
+* Face detection/profile capture happens locally.
+* Extracted identity information is stored in a local memory wiki.
+* Caregiver approves the memory.
+* Later recognition retrieves the approved memory.
+
+If implementing stubs:
+
+```swift
+final class ZeticSpeechService {
+    func transcribeDemoAudio() -> String {
+        "Hi, I'm Maya. I'm your neighbor from next door. I usually help bring in your mail."
+    }
+}
+```
+
+```swift
+final class ZeticFaceProfileService {
+    func captureDemoFaceProfile() -> (faceProfileId: String, confidence: Double) {
+        ("face-maya-001", 0.88)
+    }
+}
+```
+
+If real Melange is unavailable, keep the app compiling with mocks and TODOs.
+
+---
 
 ## Coding Style
 
-- Keep code simple and readable.
-- Prefer small files with clear responsibilities.
-- Keep state local and in-memory unless explicitly asked otherwise.
-- Use TypeScript types strictly.
-- Add comments only where they clarify product logic or safety constraints.
-- Avoid overengineering.
-- Run `npm run typecheck` and `npm run demo` after backend changes.
+* Keep the demo simple.
+* Prefer a working mock over a broken real integration.
+* Keep views separate from memory logic.
+* Use protocols for services.
+* Keep all state local/in-memory.
+* Avoid overengineering.
+* Keep patient-facing text short.
+* Make approval state obvious.
+* Do not identify unapproved people.
+* Do not add unrelated features.
+
+---
+
+## What Codex Should Do First
+
+Before coding, Codex should inspect the repo and determine:
+
+1. Whether an Xcode project exists.
+2. Which SwiftUI views currently exist.
+3. Whether there is already a camera manager.
+4. Whether there is already a memory bridge.
+5. Whether Apple Vision face detection is already partially implemented.
+6. Whether demo controls already exist.
+
+Then Codex should propose the smallest file changes to implement the focused person-memory demo.
+
+If no Xcode project exists, create documentation/stubs only and do not attempt to create a broken Xcode project unless explicitly asked.
+
+---
+
+## Validation
+
+After changes:
+
+* Build the Xcode project if possible.
+* Keep the demo flow working.
+* Keep all memory local.
+* Do not introduce medical claims.
+* Do not identify anyone before approval.
+
+```
+```

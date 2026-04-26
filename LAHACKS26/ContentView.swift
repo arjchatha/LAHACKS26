@@ -8,7 +8,9 @@
 import SwiftUI
 
 struct ContentView: View {
+    @StateObject private var memoryBridge = MockMemoryBridge()
+
     var body: some View {
-        PatientCameraView()
+        PatientCameraView(memoryBridge: memoryBridge)
     }
 }
