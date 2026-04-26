@@ -7,7 +7,7 @@
 
 import Foundation
 
-struct PersonProfileDisplay: Equatable {
+struct PersonProfileDisplay: Codable, Equatable {
     let personId: String
     let faceProfileId: String
     let name: String
@@ -17,7 +17,7 @@ struct PersonProfileDisplay: Equatable {
     let caregiverApproved: Bool
 
     var title: String {
-        "\(name) • \(relationship)"
+        relationship.isEmpty ? name : "\(name) • \(relationship)"
     }
 
     var spokenSafeSummary: String {
@@ -25,9 +25,10 @@ struct PersonProfileDisplay: Equatable {
     }
 }
 
-struct StoredPersonVideoProfile: Identifiable, Equatable {
+struct StoredPersonVideoProfile: Codable, Identifiable, Equatable {
     let profile: PersonProfileDisplay
     let videoURL: URL
+    let embedding: [Float]
     let createdAt: Date
 
     var id: String {

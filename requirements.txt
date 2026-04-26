@@ -1,0 +1,5 @@
+coremltools>=8.0
+numpy>=1.24
+onnx>=1.15
+onnxscript>=0.7
+torch>=2.1

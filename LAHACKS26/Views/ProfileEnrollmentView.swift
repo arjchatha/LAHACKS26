@@ -13,23 +13,12 @@ struct ProfileEnrollmentView: View {
     @ObservedObject var memoryBridge: MockMemoryBridge
 
     @State private var name = ""
-    @State private var relationship = ""
-    @State private var memoryCue = ""
-    @State private var detailOne = ""
-    @State private var detailTwo = ""
     @State private var isShowingVideoRecorder = false
+    @State private var isProcessingEnrollment = false
     @State private var statusMessage: String?
 
     private var trimmedName: String {
         name.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    private var trimmedRelationship: String {
-        relationship.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    private var trimmedMemoryCue: String {
-        memoryCue.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     var body: some View {
@@ -38,14 +27,6 @@ struct ProfileEnrollmentView: View {
                 Section("Profile") {
                     TextField("Name", text: $name)
                         .textContentType(.name)
-
-                    TextField("Relationship", text: $relationship)
-
-                    TextField("Memory cue", text: $memoryCue, axis: .vertical)
-                        .lineLimit(2...4)
-
-                    TextField("Detail", text: $detailOne)
-                    TextField("Detail", text: $detailTwo)
                 }
 
                 Section {
@@ -53,6 +34,11 @@ struct ProfileEnrollmentView: View {
                         startRecording()
                     } label: {
                         Label("Record Video", systemImage: "video.badge.plus")
+                    }
+                    .disabled(isProcessingEnrollment)
+
+                    if isProcessingEnrollment {
+                        ProgressView("Building face profile")
                     }
 
                     if !VideoRecorderPicker.isVideoCameraAvailable {
@@ -74,9 +60,11 @@ struct ProfileEnrollmentView: View {
                             VStack(alignment: .leading, spacing: 4) {
                                 Text(storedProfile.profile.name)
                                     .font(.headline)
-                                Text(storedProfile.profile.relationship)
-                                    .font(.subheadline)
-                                    .foregroundStyle(.secondary)
+                                if !storedProfile.profile.relationship.isEmpty {
+                                    Text(storedProfile.profile.relationship)
+                                        .font(.subheadline)
+                                        .foregroundStyle(.secondary)
+                                }
                                 Text(storedProfile.videoURL.lastPathComponent)
                                     .font(.caption)
                                     .foregroundStyle(.tertiary)
@@ -104,18 +92,10 @@ struct ProfileEnrollmentView: View {
     }
 
     private func startRecording() {
+        guard !isProcessingEnrollment else { return }
+
         guard !trimmedName.isEmpty else {
             statusMessage = "Add the person's name before recording."
-            return
-        }
-
-        guard !trimmedRelationship.isEmpty else {
-            statusMessage = "Add how this person is connected to the patient."
-            return
-        }
-
-        guard !trimmedMemoryCue.isEmpty else {
-            statusMessage = "Add the memory cue to show in Live mode."
             return
         }
 
@@ -129,23 +109,28 @@ struct ProfileEnrollmentView: View {
     }
 
     private func saveRecordedVideo(_ videoURL: URL) {
-        do {
-            let profile = try memoryBridge.enrollPersonFromVideo(
-                name: name,
-                relationship: relationship,
-                memoryCue: memoryCue,
-                detailLines: [detailOne, detailTwo],
-                sourceVideoURL: videoURL
-            )
+        isProcessingEnrollment = true
+        statusMessage = "Building face profile from the recording."
 
-            statusMessage = "\(profile.name) is ready for Live mode."
-            name = ""
-            relationship = ""
-            memoryCue = ""
-            detailOne = ""
-            detailTwo = ""
-        } catch {
-            statusMessage = error.localizedDescription
+        Task {
+            await Task.yield()
+
+            do {
+                let profile = try memoryBridge.enrollPersonFromVideo(
+                    name: name,
+                    relationship: "",
+                    memoryCue: "",
+                    detailLines: [],
+                    sourceVideoURL: videoURL
+                )
+
+                statusMessage = "\(profile.name) is ready for Live mode."
+                name = ""
+            } catch {
+                statusMessage = error.localizedDescription
+            }
+
+            isProcessingEnrollment = false
         }
     }
 

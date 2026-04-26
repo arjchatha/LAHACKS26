@@ -18,6 +18,9 @@ final class PatientCameraViewModel: ObservableObject {
         static let expandDetectionsThreshold = 2
         static let shrinkDetectionsThreshold = 3
         static let detectionMatchDistance: CGFloat = 0.24
+        static let minimumRecognitionInterval: TimeInterval = 0.65
+        static let recognitionHistoryLimit = 5
+        static let stableMatchThreshold = 3
     }
 
     @Published private(set) var detectionResult: FaceDetectionResult = .none
@@ -39,6 +42,9 @@ final class PatientCameraViewModel: ObservableObject {
     private var pendingDetectionsStreak = 0
     private var focusedBoundingBox: CGRect?
     private var smoothedBoundingBox: CGRect?
+    private var lastRecognitionDate = Date.distantPast
+    private var recognitionHistory: [String?] = []
+    private var stableRecognizedFaceProfileId: String?
     private let unknownPersonDescription = "I see someone nearby. Tap here to switch focus."
 
     convenience init() {
@@ -108,13 +114,13 @@ final class PatientCameraViewModel: ObservableObject {
             )
 
             await MainActor.run {
-                self.handleDetectionResults(results)
+                self.handleDetectionResults(results, pixelBuffer: sendablePixelBuffer.value)
                 self.isProcessingFrame = false
             }
         }
     }
 
-    private func handleDetectionResults(_ results: [FaceDetectionResult]) {
+    private func handleDetectionResults(_ results: [FaceDetectionResult], pixelBuffer: CVPixelBuffer) {
         let validResults = results.filter(\.hasFace)
         guard !validResults.isEmpty else {
             clearDetectionAfterMisses()
@@ -136,7 +142,12 @@ final class PatientCameraViewModel: ObservableObject {
             )
 
             withAnimation(.smooth(duration: 0.16)) {
-                applyDetection(smoothedResult, personIndex: focusedFaceIndex, totalPeople: activeDetections.count)
+                applyDetection(
+                    smoothedResult,
+                    personIndex: focusedFaceIndex,
+                    totalPeople: activeDetections.count,
+                    pixelBuffer: pixelBuffer
+                )
             }
             return
         }
@@ -159,6 +170,8 @@ final class PatientCameraViewModel: ObservableObject {
         pendingDetections = []
         pendingDetectionsStreak = 0
         focusedFaceIndex = 0
+        recognitionHistory = []
+        stableRecognizedFaceProfileId = nil
 
         withAnimation(.easeOut(duration: 0.2)) {
             applyDetection(.none, personIndex: 0, totalPeople: 0)
@@ -184,7 +197,12 @@ final class PatientCameraViewModel: ObservableObject {
         return smoothedRect
     }
 
-    private func applyDetection(_ result: FaceDetectionResult, personIndex: Int, totalPeople: Int) {
+    private func applyDetection(
+        _ result: FaceDetectionResult,
+        personIndex: Int,
+        totalPeople: Int,
+        pixelBuffer: CVPixelBuffer? = nil
+    ) {
         detectionResult = result
         guard result.hasFace, totalPeople > 0 else {
             focusedPersonTitle = nil
@@ -197,7 +215,7 @@ final class PatientCameraViewModel: ObservableObject {
             ? "Person \(personIndex + 1) of \(totalPeople)"
             : "Person nearby"
 
-        guard let faceProfileId = memoryBridge.mockRecognizedFaceProfileId(for: result) else {
+        guard let faceProfileId = stableRecognizedFaceProfileId ?? recognizedFaceProfileIdIfNeeded(for: result, pixelBuffer: pixelBuffer) else {
             focusedPersonTitle = fallbackTitle
             detectedPersonDescription = unknownPersonDescription
             detectedPersonDetailLines = []
@@ -208,6 +226,36 @@ final class PatientCameraViewModel: ObservableObject {
         focusedPersonTitle = displayResult.title
         detectedPersonDescription = displayResult.description
         detectedPersonDetailLines = displayResult.detailLines
+    }
+
+    private func recognizedFaceProfileIdIfNeeded(for result: FaceDetectionResult, pixelBuffer: CVPixelBuffer?) -> String? {
+        guard let pixelBuffer else { return nil }
+
+        let now = Date()
+        guard now.timeIntervalSince(lastRecognitionDate) >= Constants.minimumRecognitionInterval else {
+            return stableRecognizedFaceProfileId
+        }
+
+        lastRecognitionDate = now
+        let match = memoryBridge.recognizedFaceProfileId(for: result, in: pixelBuffer)
+        recognitionHistory.append(match)
+
+        if recognitionHistory.count > Constants.recognitionHistoryLimit {
+            recognitionHistory.removeFirst(recognitionHistory.count - Constants.recognitionHistoryLimit)
+        }
+
+        stableRecognizedFaceProfileId = stableMatch(from: recognitionHistory)
+        return stableRecognizedFaceProfileId
+    }
+
+    private func stableMatch(from history: [String?]) -> String? {
+        let counts = history.compactMap(\.self).reduce(into: [String: Int]()) { result, faceProfileId in
+            result[faceProfileId, default: 0] += 1
+        }
+
+        return counts.first { _, count in
+            count >= Constants.stableMatchThreshold
+        }?.key
     }
 
     private func resolvedStableDetections(from detections: [FaceDetectionResult]) -> [FaceDetectionResult] {
