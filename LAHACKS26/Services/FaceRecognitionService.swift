@@ -40,7 +40,7 @@ final class FaceRecognitionService {
         static let maximumEnrollmentFrames = 10
         static let enrollmentFrameStrideSeconds = 0.35
         static let minimumFaceArea: CGFloat = 0.012
-        static let minimumSimilarity: Float = 0.72
+        static let minimumSimilarity: Float = 0.6
     }
 
     private let cropper = FaceCropper()

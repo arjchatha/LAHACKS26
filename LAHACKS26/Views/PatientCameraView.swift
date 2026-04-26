@@ -26,8 +26,8 @@ struct PatientCameraView: View {
             if viewModel.detectionResult.hasFace {
                 FaceBoundingBoxOverlay(
                     detection: viewModel.detectionResult,
-                    title: viewModel.focusedPersonTitle ?? "Person nearby",
-                    description: viewModel.detectedPersonDescription ?? "I see someone nearby.",
+                    title: viewModel.focusedPersonTitle ?? "Unknown person",
+                    description: viewModel.detectedPersonDescription ?? "Unknown person.",
                     detailLines: viewModel.detectedPersonDetailLines,
                     onDescriptionTap: viewModel.focusNextPerson
                 )

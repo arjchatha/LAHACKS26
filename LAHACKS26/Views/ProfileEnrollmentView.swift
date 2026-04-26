@@ -14,6 +14,7 @@ struct ProfileEnrollmentView: View {
 
     @State private var name = ""
     @State private var isShowingVideoRecorder = false
+    @State private var isShowingVideoUploader = false
     @State private var isProcessingEnrollment = false
     @State private var statusMessage: String?
 
@@ -37,12 +38,25 @@ struct ProfileEnrollmentView: View {
                     }
                     .disabled(isProcessingEnrollment)
 
+                    Button {
+                        startUpload()
+                    } label: {
+                        Label("Upload Video", systemImage: "square.and.arrow.up")
+                    }
+                    .disabled(isProcessingEnrollment)
+
                     if isProcessingEnrollment {
                         ProgressView("Building face profile")
                     }
 
                     if !VideoRecorderPicker.isVideoCameraAvailable {
                         Text("Video recording needs a physical iPhone camera.")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    if !VideoLibraryPicker.isVideoLibraryAvailable {
+                        Text("Video upload needs access to the photo library.")
                             .font(.footnote)
                             .foregroundStyle(.secondary)
                     }
@@ -85,7 +99,13 @@ struct ProfileEnrollmentView: View {
         }
         .sheet(isPresented: $isShowingVideoRecorder) {
             VideoRecorderPicker { videoURL in
-                saveRecordedVideo(videoURL)
+                saveSelectedVideo(videoURL, sourceDescription: "recording")
+            }
+            .ignoresSafeArea()
+        }
+        .sheet(isPresented: $isShowingVideoUploader) {
+            VideoLibraryPicker { videoURL in
+                saveSelectedVideo(videoURL, sourceDescription: "uploaded video")
             }
             .ignoresSafeArea()
         }
@@ -108,9 +128,26 @@ struct ProfileEnrollmentView: View {
         isShowingVideoRecorder = true
     }
 
-    private func saveRecordedVideo(_ videoURL: URL) {
+    private func startUpload() {
+        guard !isProcessingEnrollment else { return }
+
+        guard !trimmedName.isEmpty else {
+            statusMessage = "Add the person's name before uploading a video."
+            return
+        }
+
+        guard VideoLibraryPicker.isVideoLibraryAvailable else {
+            statusMessage = "Video upload is not available here."
+            return
+        }
+
+        statusMessage = nil
+        isShowingVideoUploader = true
+    }
+
+    private func saveSelectedVideo(_ videoURL: URL, sourceDescription: String) {
         isProcessingEnrollment = true
-        statusMessage = "Building face profile from the recording."
+        statusMessage = "Building face profile from the \(sourceDescription)."
 
         Task {
             await Task.yield()
@@ -137,6 +174,52 @@ struct ProfileEnrollmentView: View {
     private func deleteProfile(_ storedProfile: StoredPersonVideoProfile) {
         memoryBridge.deleteVideoProfile(personId: storedProfile.profile.personId)
         statusMessage = "\(storedProfile.profile.name) was deleted."
+    }
+}
+
+struct VideoLibraryPicker: UIViewControllerRepresentable {
+    let onVideoSelected: (URL) -> Void
+
+    static var isVideoLibraryAvailable: Bool {
+        UIImagePickerController.isSourceTypeAvailable(.photoLibrary)
+            && (UIImagePickerController.availableMediaTypes(for: .photoLibrary) ?? []).contains(UTType.movie.identifier)
+    }
+
+    func makeUIViewController(context: Context) -> UIImagePickerController {
+        let picker = UIImagePickerController()
+        picker.delegate = context.coordinator
+        picker.sourceType = .photoLibrary
+        picker.mediaTypes = [UTType.movie.identifier]
+        picker.videoQuality = .typeMedium
+        return picker
+    }
+
+    func updateUIViewController(_ uiViewController: UIImagePickerController, context: Context) {}
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(onVideoSelected: onVideoSelected)
+    }
+
+    final class Coordinator: NSObject, UINavigationControllerDelegate, UIImagePickerControllerDelegate {
+        let onVideoSelected: (URL) -> Void
+
+        init(onVideoSelected: @escaping (URL) -> Void) {
+            self.onVideoSelected = onVideoSelected
+        }
+
+        func imagePickerController(
+            _ picker: UIImagePickerController,
+            didFinishPickingMediaWithInfo info: [UIImagePickerController.InfoKey: Any]
+        ) {
+            if let mediaURL = info[.mediaURL] as? URL {
+                onVideoSelected(mediaURL)
+            }
+            picker.dismiss(animated: true)
+        }
+
+        func imagePickerControllerDidCancel(_ picker: UIImagePickerController) {
+            picker.dismiss(animated: true)
+        }
     }
 }
 

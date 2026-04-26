@@ -18,9 +18,9 @@ final class PatientCameraViewModel: ObservableObject {
         static let expandDetectionsThreshold = 2
         static let shrinkDetectionsThreshold = 3
         static let detectionMatchDistance: CGFloat = 0.24
-        static let minimumRecognitionInterval: TimeInterval = 0.65
-        static let recognitionHistoryLimit = 5
-        static let stableMatchThreshold = 3
+        static let minimumRecognitionInterval: TimeInterval = 0.4
+        static let recognitionHistoryLimit = 4
+        static let stableMatchThreshold = 2
     }
 
     @Published private(set) var detectionResult: FaceDetectionResult = .none
@@ -45,7 +45,7 @@ final class PatientCameraViewModel: ObservableObject {
     private var lastRecognitionDate = Date.distantPast
     private var recognitionHistory: [String?] = []
     private var stableRecognizedFaceProfileId: String?
-    private let unknownPersonDescription = "I see someone nearby. Tap here to switch focus."
+    private let unknownPersonDescription = "Unknown person. Tap here to switch focus."
 
     convenience init() {
         self.init(memoryBridge: MockMemoryBridge())
@@ -213,7 +213,7 @@ final class PatientCameraViewModel: ObservableObject {
 
         let fallbackTitle = totalPeople > 1
             ? "Person \(personIndex + 1) of \(totalPeople)"
-            : "Person nearby"
+            : "Unknown person"
 
         guard let faceProfileId = stableRecognizedFaceProfileId ?? recognizedFaceProfileIdIfNeeded(for: result, pixelBuffer: pixelBuffer) else {
             focusedPersonTitle = fallbackTitle

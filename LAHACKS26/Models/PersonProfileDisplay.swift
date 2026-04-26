@@ -45,7 +45,7 @@ enum PersonProfileDisplayResult: Equatable {
         case .approved(let profile):
             return profile.title
         case .unknown:
-            return "Person nearby"
+            return "Unknown person"
         }
     }
 

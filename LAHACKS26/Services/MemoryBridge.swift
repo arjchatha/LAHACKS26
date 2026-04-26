@@ -40,7 +40,7 @@ final class MockMemoryBridge: ObservableObject, MemoryBridge {
         static let rahulFaceProfileId = "face-rahul-001"
         static let mayaPersonId = "person-maya"
         static let mayaFaceProfileId = "face-maya-001"
-        static let cautiousUnknownResponse = "I see someone nearby, but I do not have a caregiver-approved identity for them yet."
+        static let cautiousUnknownResponse = "Unknown person. I do not have a caregiver-approved identity for them yet."
         static let approvedMayaResponse = "This is Maya, your neighbor from next door."
     }
 
