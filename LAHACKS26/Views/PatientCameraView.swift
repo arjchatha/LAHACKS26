@@ -6,6 +6,7 @@
 //
 
 import SwiftUI
+import UIKit
 
 struct PatientCameraView: View {
     @ObservedObject var memoryBridge: MockMemoryBridge
@@ -14,6 +15,9 @@ struct PatientCameraView: View {
     @StateObject private var memoryCoordinator: MemoryCoordinator
     @StateObject private var textToSpeechService = TextToSpeechService()
     @State private var saveBanner: SaveBanner?
+    @State private var saveBannerExpanded = false
+    @State private var saveBannerContentVisible = false
+    @State private var saveBannerTask: Task<Void, Never>?
     @State private var faceGateTask: Task<Void, Never>?
     @State private var stopTranscriptionTask: Task<Void, Never>?
     @State private var transcriptionActive = false
@@ -30,6 +34,9 @@ struct PatientCameraView: View {
         } ?? .unknown("Unknown face")
 
         GeometryReader { geometry in
+            let islandTopOffset = dynamicIslandTopOffset(in: geometry)
+            let islandExpandedWidth = min(geometry.size.width - 36, 356)
+
             ZStack {
                 Color.black
                     .ignoresSafeArea(.all)
@@ -56,17 +63,22 @@ struct PatientCameraView: View {
                         .padding(.horizontal, 22)
                 }
 
-                VStack(alignment: .trailing, spacing: 10) {
+                VStack(spacing: 0) {
                     if let saveBanner {
-                        SaveBannerView(banner: saveBanner)
-                            .transition(.move(edge: .top).combined(with: .opacity))
+                        SaveBannerView(
+                            banner: saveBanner,
+                            isExpanded: saveBannerExpanded,
+                            isContentVisible: saveBannerContentVisible,
+                            expandedWidth: islandExpandedWidth
+                        )
+                            .transition(.identity)
                     }
 
                     Spacer()
                 }
-                .frame(width: geometry.size.width, height: geometry.size.height, alignment: .topTrailing)
-                .padding(.top, 34)
-                .padding(.trailing, 30)
+                .frame(width: geometry.size.width, height: geometry.size.height, alignment: .top)
+                .padding(.top, islandTopOffset + 15)
+                .padding(.horizontal, 18)
                 .allowsHitTesting(false)
             }
             .frame(width: geometry.size.width, height: geometry.size.height)
@@ -99,6 +111,7 @@ struct PatientCameraView: View {
             }
         }
         .onDisappear {
+            saveBannerTask?.cancel()
             faceGateTask?.cancel()
             stopTranscriptionTask?.cancel()
             stopFaceBoundTranscription()
@@ -199,21 +212,77 @@ struct PatientCameraView: View {
     }
 
     private func showSavedBanner(for event: MemoryCoordinatorEvent) {
-        let banner = SaveBanner(id: event.id, title: event.title, subtitle: event.subtitle)
+        let title: String
 
-        withAnimation(.spring(response: 0.32, dampingFraction: 0.86)) {
-            saveBanner = banner
+        switch event.kind {
+        case .saving:
+            title = "Saving Memory"
+        case .stored, .noted:
+            title = "Memory Saved"
         }
 
-        Task { @MainActor in
-            try? await Task.sleep(for: .seconds(3))
+        showSaveBanner(SaveBanner(id: event.id, title: title, subtitle: event.subtitle))
+    }
+
+    private func showSaveBanner(_ banner: SaveBanner) {
+        saveBannerTask?.cancel()
+        saveBanner = banner
+        saveBannerExpanded = false
+        saveBannerContentVisible = false
+
+        saveBannerTask = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(70))
             guard saveBanner?.id == banner.id else { return }
 
-            withAnimation(.easeOut(duration: 0.22)) {
+            withAnimation(.smooth(duration: 0.42, extraBounce: 0.10)) {
+                saveBannerExpanded = true
+            }
+
+            try? await Task.sleep(for: .milliseconds(220))
+            guard saveBanner?.id == banner.id else { return }
+
+            withAnimation(.easeOut(duration: 0.16)) {
+                saveBannerContentVisible = true
+            }
+
+            try? await Task.sleep(for: .seconds(2.25))
+            guard saveBanner?.id == banner.id else { return }
+
+            withAnimation(.easeInOut(duration: 0.14)) {
+                saveBannerContentVisible = false
+            }
+
+            try? await Task.sleep(for: .milliseconds(150))
+            guard saveBanner?.id == banner.id else { return }
+
+            withAnimation(.smooth(duration: 0.36, extraBounce: 0.02)) {
+                saveBannerExpanded = false
+            }
+
+            try? await Task.sleep(for: .milliseconds(360))
+            guard saveBanner?.id == banner.id else { return }
+
+            withAnimation(.easeOut(duration: 0.10)) {
                 saveBanner = nil
             }
+            saveBannerTask = nil
             memoryCoordinator.clearLatestEvent()
         }
+    }
+
+    private func dynamicIslandTopOffset(in geometry: GeometryProxy) -> CGFloat {
+        let modelName = UIDevice.current.name.lowercased()
+        let hasDynamicIslandNameHint = modelName.contains("iphone 14 pro")
+            || modelName.contains("iphone 15")
+            || modelName.contains("iphone 16")
+            || modelName.contains("iphone 17")
+        let likelyDynamicIsland = hasDynamicIslandNameHint || geometry.safeAreaInsets.top >= 54
+
+        if likelyDynamicIsland {
+            return max(54, geometry.safeAreaInsets.top + 2)
+        }
+
+        return max(12, geometry.safeAreaInsets.top - 18)
     }
 }
 
@@ -264,45 +333,82 @@ private struct SaveBanner: Identifiable, Equatable {
 
 private struct SaveBannerView: View {
     let banner: SaveBanner
+    let isExpanded: Bool
+    let isContentVisible: Bool
+    let expandedWidth: CGFloat
+
+    private let compactWidth: CGFloat = 92
+    private let compactHeight: CGFloat = 26
+    private let expandedHeight: CGFloat = 118
+
+    private var shapeWidth: CGFloat { isExpanded ? expandedWidth : compactWidth }
+    private var shapeHeight: CGFloat { isExpanded ? expandedHeight : compactHeight }
+    private var shapeRadius: CGFloat { isExpanded ? 46 : 18 }
+
+    private var subtitleText: String {
+        if let subtitle = banner.subtitle, !subtitle.isEmpty {
+            return subtitle
+        }
+
+        return "Saved for later recall"
+    }
 
     var body: some View {
-        let content = HStack(spacing: 10) {
-            Image(systemName: "checkmark.circle.fill")
-                .font(.subheadline.weight(.semibold))
-                .symbolRenderingMode(.hierarchical)
+        ZStack(alignment: .top) {
+            RoundedRectangle(cornerRadius: shapeRadius, style: .continuous)
+                .fill(.black)
+                .frame(width: shapeWidth, height: shapeHeight)
+                .overlay {
+                    RoundedRectangle(cornerRadius: shapeRadius, style: .continuous)
+                        .stroke(.white.opacity(isExpanded ? 0.07 : 0), lineWidth: 0.6)
+                }
+                .shadow(color: .black.opacity(0.34), radius: 18, y: 8)
+
+            expandedContent
+                .opacity(isContentVisible ? 1 : 0)
+                .scaleEffect(isContentVisible ? 1 : 0.985, anchor: .center)
+                .offset(y: isContentVisible ? 0 : -2)
+                .allowsHitTesting(false)
+        }
+        .frame(width: expandedWidth, height: expandedHeight, alignment: .top)
+        .animation(.easeOut(duration: 0.18), value: isContentVisible)
+    }
+
+    private var expandedContent: some View {
+        HStack(spacing: 12) {
+            ZStack {
+                Circle()
+                    .fill(Color(red: 0.20, green: 0.78, blue: 0.35))
+                    .overlay {
+                        Circle()
+                            .stroke(.white.opacity(0.16), lineWidth: 1)
+                    }
+
+                Image(systemName: "checkmark")
+                    .font(.system(size: 23, weight: .bold))
+                    .foregroundStyle(.white)
+            }
+            .frame(width: 50, height: 50)
 
             VStack(alignment: .leading, spacing: 1) {
                 Text(banner.title)
-                    .font(.callout.weight(.bold))
-                if let subtitle = banner.subtitle {
-                    Text(subtitle)
-                        .font(.caption.weight(.semibold))
-                        .opacity(0.85)
-                }
-            }
-        }
-        .foregroundStyle(.white)
-        .padding(.horizontal, 13)
-        .padding(.vertical, 10)
+                    .font(.headline.weight(.semibold))
+                    .foregroundStyle(.white)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.84)
 
-        Group {
-            if #available(iOS 26.0, *) {
-                content
-                    .glassEffect(.regular.tint(.green.opacity(0.48)), in: Capsule())
-                    .overlay {
-                        Capsule()
-                            .stroke(.white.opacity(0.28), lineWidth: 1)
-                    }
-            } else {
-                content
-                    .background(.green.opacity(0.9), in: Capsule())
-                    .overlay {
-                        Capsule()
-                            .stroke(.white.opacity(0.22), lineWidth: 1)
-                    }
+                Text(subtitleText)
+                    .font(.subheadline.weight(.medium))
+                    .foregroundStyle(.white.opacity(0.42))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.78)
             }
+
+            Spacer(minLength: 0)
         }
-        .shadow(color: .black.opacity(0.24), radius: 14, y: 7)
+        .padding(.horizontal, 18)
+        .padding(.top, 36)
+        .frame(width: expandedWidth, height: expandedHeight, alignment: .top)
     }
 }
 
