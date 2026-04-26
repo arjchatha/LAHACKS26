@@ -14,6 +14,10 @@ struct CameraPreviewView: UIViewRepresentable {
 
     func makeUIView(context: Context) -> PreviewLayerView {
         let view = PreviewLayerView()
+        view.backgroundColor = .black
+        view.clipsToBounds = true
+        view.contentMode = .scaleAspectFill
+        view.isOpaque = true
         view.setPreviewLayer(previewLayer)
         return view
     }
@@ -27,19 +31,30 @@ final class PreviewLayerView: UIView {
     private var hostedPreviewLayer: AVCaptureVideoPreviewLayer?
 
     func setPreviewLayer(_ previewLayer: AVCaptureVideoPreviewLayer) {
+        layer.masksToBounds = true
+        previewLayer.videoGravity = .resizeAspectFill
+
         guard hostedPreviewLayer !== previewLayer else {
-            previewLayer.frame = bounds
+            layoutPreviewLayer(previewLayer)
             return
         }
 
         hostedPreviewLayer?.removeFromSuperlayer()
         hostedPreviewLayer = previewLayer
         layer.addSublayer(previewLayer)
-        previewLayer.frame = bounds
+        layoutPreviewLayer(previewLayer)
     }
 
     override func layoutSubviews() {
         super.layoutSubviews()
-        hostedPreviewLayer?.frame = bounds
+        guard let hostedPreviewLayer else { return }
+        layoutPreviewLayer(hostedPreviewLayer)
+    }
+
+    private func layoutPreviewLayer(_ previewLayer: AVCaptureVideoPreviewLayer) {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        previewLayer.frame = bounds
+        CATransaction.commit()
     }
 }

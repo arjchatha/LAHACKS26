@@ -327,3 +327,125 @@ private extension CGRect {
         insetBy(dx: -width * amount, dy: -height * amount)
     }
 }
+
+struct FaceEmbedding: Equatable {
+    var values: [Float]
+
+    nonisolated func cosineDistance(to other: FaceEmbedding) -> Float {
+        let count = min(values.count, other.values.count)
+        guard count > 0 else { return 1 }
+
+        var dotProduct: Float = 0
+        var leftMagnitude: Float = 0
+        var rightMagnitude: Float = 0
+
+        for index in 0..<count {
+            let left = values[index]
+            let right = other.values[index]
+            dotProduct += left * right
+            leftMagnitude += left * left
+            rightMagnitude += right * right
+        }
+
+        guard leftMagnitude > 0, rightMagnitude > 0 else { return 1 }
+
+        let similarity = dotProduct / (sqrt(leftMagnitude) * sqrt(rightMagnitude))
+        return 1 - max(-1, min(1, similarity))
+    }
+
+    nonisolated static func mean(of embeddings: [FaceEmbedding]) -> FaceEmbedding? {
+        guard let first = embeddings.first else { return nil }
+
+        var totals = Array(repeating: Float(0), count: first.values.count)
+        var contributingEmbeddings = 0
+
+        for embedding in embeddings where embedding.values.count == totals.count {
+            contributingEmbeddings += 1
+            for index in totals.indices {
+                totals[index] += embedding.values[index]
+            }
+        }
+
+        guard contributingEmbeddings > 0 else { return nil }
+
+        return FaceEmbedding(values: totals.map { $0 / Float(contributingEmbeddings) })
+    }
+}
+
+private struct HybridFaceEmbeddingProvider {
+    nonisolated var isModelBacked: Bool {
+        false
+    }
+
+    nonisolated init() {}
+
+    nonisolated func embedding(in pixelBuffer: CVPixelBuffer, visionBoundingBox: CGRect) -> FaceEmbedding? {
+        let width = max(1, CVPixelBufferGetWidth(pixelBuffer))
+        let height = max(1, CVPixelBufferGetHeight(pixelBuffer))
+        let box = visionBoundingBox.clampedToUnitRect()
+
+        let features: [Float] = [
+            Float(box.midX),
+            Float(box.midY),
+            Float(box.width),
+            Float(box.height),
+            Float(box.width * box.height),
+            Float(width) / 10_000,
+            Float(height) / 10_000,
+            Float(box.minX),
+            Float(box.minY),
+            Float(box.maxX),
+            Float(box.maxY),
+            Float(box.width / max(box.height, 0.001)),
+            Float((box.midX - 0.5) * 2),
+            Float((box.midY - 0.5) * 2),
+            Float(sqrt(box.width * box.height)),
+            1
+        ]
+
+        return FaceEmbedding(values: features)
+    }
+}
+
+struct FaceIdentityStabilizer {
+    let requiredConsecutiveFrames: Int
+    private(set) var stableProfileId: String?
+    private var candidateProfileId: String?
+    private var candidateFrameCount = 0
+
+    nonisolated init(requiredConsecutiveFrames: Int) {
+        self.requiredConsecutiveFrames = requiredConsecutiveFrames
+    }
+
+    nonisolated mutating func resolvedProfileId(for profileId: String?) -> String? {
+        guard let profileId else {
+            reset()
+            return nil
+        }
+
+        if profileId == stableProfileId {
+            return stableProfileId
+        }
+
+        if profileId == candidateProfileId {
+            candidateFrameCount += 1
+        } else {
+            candidateProfileId = profileId
+            candidateFrameCount = 1
+            stableProfileId = nil
+        }
+
+        if candidateFrameCount >= max(1, requiredConsecutiveFrames) {
+            stableProfileId = profileId
+            return profileId
+        }
+
+        return nil
+    }
+
+    nonisolated mutating func reset() {
+        stableProfileId = nil
+        candidateProfileId = nil
+        candidateFrameCount = 0
+    }
+}

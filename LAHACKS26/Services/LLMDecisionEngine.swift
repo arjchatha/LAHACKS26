@@ -266,9 +266,11 @@ actor AppleFoundationModelsDecisionEngine: LLMDecisionEngine {
             instructions: """
             You are MindAnchor's local memory coordinator. Decide whether a live speech transcript contains information worth storing in a private memory wiki for a person with early memory loss.
 
-            Be conservative. Most conversation should not be stored.
+            Be conservative. Most conversation should not be stored. Your output is a semantic analysis signal; a separate local MemoryCapturePolicy will make the final save/no-save decision using your fields plus transcript evidence.
 
             Store explicit facts that are likely to help the patient later. This includes person identity, recent interactions, recent events, plans or intentions, preferences, important life facts, and emotional context.
+
+            Treat face-bound introductions as important. A name-only introduction such as "I am David" is a weak person candidate: store it as a low-confidence draft that needs caregiver review because the active face profile can be enriched later. A name paired with relationship, role, school/work context, neighborhood context, caregiving context, or useful life context should be a stronger person memory.
 
             Do not store greetings, jokes, acknowledgements, filler, uncertain guesses, or vague impressions. Store temporary information only when it is useful soon, such as plans, errands, travel, or recent events. If uncertain, set shouldStore to false. Keep patient responses short, calm, and safe. Do not make medical claims.
             """
@@ -307,8 +309,8 @@ actor AppleFoundationModelsDecisionEngine: LLMDecisionEngine {
             transcript: recentTranscript,
             instructions: """
             This is a fast live layer while the patient is looking at the person.
-            Update provisional beliefs, and set shouldStore true as soon as the transcript contains a clear patient-useful memory.
-            Useful memories include introductions, plans, errands, recent events, deaths or funerals, travel, caregiving context, preferences, emotional context, or what this person last talked about.
+            Update provisional beliefs, and set shouldStore true as soon as the transcript contains a clear patient-useful memory. Focus on semantic classification and extraction; a separate policy layer will handle final storage.
+            Useful memories include introductions, weak name-only person candidates, plans, errands, recent events, deaths or funerals, travel, caregiving context, preferences, emotional context, or what this person last talked about.
             Keep shouldStore false for partial, ambiguous, or merely social speech. Never invent placeholder values such as "person", "relationship", "context", or "name". Every stored memory must include an exact evidenceQuote copied from the transcript.
             """
         )
@@ -324,7 +326,7 @@ actor AppleFoundationModelsDecisionEngine: LLMDecisionEngine {
             transcript: transcriptWindow,
             instructions: """
             This is a periodic reconciliation layer over a wider rolling transcript window.
-            Correct earlier misunderstandings, merge duplicate entities, revise confidence scores, and remove weak facts.
+            Correct earlier misunderstandings, merge duplicate entities, revise confidence scores, and remove weak facts. Focus on semantic classification and extraction; a separate policy layer will handle final storage.
             Set shouldStore true for any clear patient-useful memory: identity, last interaction, recent event, plan, preference, important life fact, or emotional context.
             Every stored memory must include an exact evidenceQuote copied from the transcript.
             """
@@ -341,7 +343,7 @@ actor AppleFoundationModelsDecisionEngine: LLMDecisionEngine {
             transcript: fullTranscript,
             instructions: """
             This is the final full-context pass after the face-bound conversation ended.
-            Produce the cleanest relationship graph, interaction summary, and final storage decision.
+            Produce the cleanest relationship graph, interaction summary, and semantic storage recommendation. A separate policy layer will handle final storage.
             Set shouldStore true for any clear patient-useful memory: identity, last interaction, recent event, plan, preference, important life fact, or emotional context.
             Every stored memory must include an exact evidenceQuote copied from the transcript.
             """
@@ -398,6 +400,8 @@ actor AppleFoundationModelsDecisionEngine: LLMDecisionEngine {
         Transcript:
         \(transcript)
 
+        The transcript may combine nearby speech fragments from the same active face profile. Treat them as one face-bound conversation. For example, "I am David" followed by "We go to the same school" should become one draft person memory for David with helpful context "goes to the same school".
+
         Field requirements:
         - shouldStore: true only when the transcript contains explicit durable memory information worth saving for later patient support.
         - memoryType: one of person, lastInteraction, recentEvent, emotionalContext, planOrIntention, preference, importantLifeFact, routine, none.
@@ -411,19 +415,24 @@ actor AppleFoundationModelsDecisionEngine: LLMDecisionEngine {
         - emotionalContext: short emotional context such as "grieving", "excited", or "stressed", otherwise null.
         - followUpContext: gentle future reminder or follow-up context, otherwise null.
         - retentionHint: one of shortTerm, recent, longTerm, otherwise null.
-        - needsCaregiverReview: false for this patient-facing prototype.
+        - needsCaregiverReview: true for weak person candidates or any identity that lacks relationship/context.
         - patientSafeResponse: short spoken response if storing, otherwise null.
 
         Conservative storage policy:
         - Set shouldStore false unless the transcript contains a complete, useful memory.
-        - A named person introduction with a family relationship, social relationship, role, or helpful context is a complete useful memory.
+        - A named person introduction is a useful weak person candidate in this face-bound capture flow, even if relationship or context is not known yet.
+        - A named self-introduction with school, work, role, neighborhood, caregiving, or practical life context is a complete useful memory.
         - A recent event, plan, preference, emotionally important life event, or last-interaction detail can be useful even without a person name.
-        - For person memories, extractedName must be non-null and at least one of extractedRelationship or extractedHelpfulContext must be non-null.
+        - For person memories, extractedName must be non-null. extractedRelationship and extractedHelpfulContext can be null if only the name was captured.
         - For non-person memories, interactionSummary and evidenceQuote must be non-null.
-        - Use storageConfidence below 0.8 whenever the transcript is ambiguous, incomplete, or merely social.
+        - Use storageConfidence 0.45 to 0.65 for weak name-only person candidates.
+        - Use storageConfidence below 0.8 whenever the transcript is ambiguous, incomplete, or merely social unless it is a clear name-only introduction.
         - Never use placeholders such as "person", "relationship", "context", or "name" as extracted values.
         - Examples of store-worthy memories:
           "This is Akshay, he's my grandson" -> memoryType person.
+          "I am David" -> shouldStore true, memoryType person, importance low, extractedName "David", extractedRelationship null, extractedHelpfulContext null, needsCaregiverReview true, storageConfidence 0.55.
+          "I am David. We go to the same school" -> shouldStore true, memoryType person, extractedName "David", extractedHelpfulContext "goes to the same school", needsCaregiverReview true.
+          "Hello, I'm Rishab. I go to school." -> memoryType person, extractedName "Rishab", extractedHelpfulContext "goes to school", storageConfidence at least 0.85.
           "I just got back from my brother's funeral" -> memoryType emotionalContext or recentEvent.
           "I'm heading to the store, do you need anything?" -> memoryType planOrIntention with shortTerm retention.
           "I love black coffee in the morning" -> memoryType preference.
@@ -444,6 +453,8 @@ actor AppleFoundationModelsDecisionEngine: LLMDecisionEngine {
 
         New \(phase) transcript input:
         \(transcript)
+
+        This input may include nearby fragments from the same active face profile. Combine them before deciding. If one fragment gives the name and a later fragment gives school, neighborhood, work, caregiver, or helpful context, store/update one person memory.
 
         Return:
         - conversationStateJSON: valid compact JSON with this shape:
@@ -467,14 +478,18 @@ actor AppleFoundationModelsDecisionEngine: LLMDecisionEngine {
 
         Storage rules:
         - shouldStore should be true during live, reconciliation, or final when the transcript contains clear patient-useful memory.
-        - Person memories require a clear name and either a relationship/role or helpful practical context.
+        - Person memories require a clear name. A relationship, role, school/work context, neighborhood context, caregiving context, or helpful practical context is useful but not required.
         - Last interaction, recent event, emotional context, plan, preference, important life fact, or routine memories require interactionSummary and exact evidenceQuote.
-        - Identity/person memories must set needsCaregiverReview false in this patient-facing prototype.
-        - Use storageConfidence below 0.8 for ambiguous, partial, social, or temporary statements.
+        - Identity/person memories must set needsCaregiverReview true when relationship/context is missing.
+        - Use storageConfidence 0.45 to 0.65 for weak name-only person candidates.
+        - Use storageConfidence below 0.8 for ambiguous, partial, social, or temporary statements unless it is a clear name-only introduction.
         - Never use placeholders such as "person", "relationship", "context", or "name" as extracted values.
         - Examples of outputs that should store:
           "This is Akshay, he's my grandson" -> shouldStore true, memoryType person, extractedName "Akshay", extractedRelationship "grandson", storageConfidence at least 0.85.
           "This is Maya, my neighbor from next door" -> shouldStore true, memoryType person, extractedName "Maya", extractedRelationship "neighbor from next door", storageConfidence at least 0.85.
+          "I am David" -> shouldStore true, memoryType person, importance low, extractedName "David", extractedRelationship null, extractedHelpfulContext null, needsCaregiverReview true, storageConfidence 0.55.
+          "I am David. We go to the same school" -> shouldStore true, memoryType person, extractedName "David", extractedHelpfulContext "goes to the same school", needsCaregiverReview true, storageConfidence at least 0.75.
+          "Hello, I'm Rishab. I go to school." -> shouldStore true, memoryType person, extractedName "Rishab", extractedHelpfulContext "goes to school", storageConfidence at least 0.85.
           "I just got back from my brother's funeral" -> shouldStore true, memoryType emotionalContext, interactionSummary "They recently got back from their brother's funeral.", evidenceQuote "I just got back from my brother's funeral".
           "I'm going to the store" -> shouldStore true, memoryType planOrIntention, interactionSummary "They said they were going to the store.", retentionHint shortTerm.
         """
@@ -494,10 +509,6 @@ actor AppleFoundationModelsDecisionEngine: LLMDecisionEngine {
         )
         let confidence = try content.value(Double.self, forProperty: "storageConfidence")
 
-        guard shouldStore, memoryType != .none, confidence >= 0.75 else {
-            return .ignored(patientSafeResponse: try content.value(String?.self, forProperty: "patientSafeResponse"))
-        }
-
         let extractedName = try cleaned(content.value(String?.self, forProperty: "extractedName"))
         let extractedRelationship = try cleaned(content.value(String?.self, forProperty: "extractedRelationship"))
         let extractedHelpfulContext = try cleaned(content.value(String?.self, forProperty: "extractedHelpfulContext"))
@@ -506,14 +517,38 @@ actor AppleFoundationModelsDecisionEngine: LLMDecisionEngine {
         let emotionalContext = try cleaned(content.value(String?.self, forProperty: "emotionalContext"))
         let followUpContext = try cleaned(content.value(String?.self, forProperty: "followUpContext"))
         let retentionHint = try cleaned(content.value(String?.self, forProperty: "retentionHint"))
+        let needsCaregiverReview = try content.value(Bool.self, forProperty: "needsCaregiverReview")
+        let patientSafeResponse = try cleaned(content.value(String?.self, forProperty: "patientSafeResponse"))
+
+        let rejectedDecision = TranscriptAnalysisDecision(
+            shouldStore: false,
+            memoryType: memoryType,
+            importance: importance,
+            storageConfidence: confidence,
+            extractedName: extractedName,
+            extractedRelationship: extractedRelationship,
+            extractedHelpfulContext: extractedHelpfulContext,
+            interactionSummary: interactionSummary,
+            evidenceQuote: evidenceQuote,
+            emotionalContext: emotionalContext,
+            followUpContext: followUpContext,
+            retentionHint: retentionHint,
+            needsCaregiverReview: needsCaregiverReview,
+            patientSafeResponse: patientSafeResponse
+        )
+
+        let minimumConfidence = memoryType == .person && extractedName != nil ? 0.45 : 0.75
+        guard shouldStore, memoryType != .none, confidence >= minimumConfidence else {
+            return rejectedDecision
+        }
 
         if memoryType == .person {
-            guard extractedName != nil, extractedRelationship != nil || extractedHelpfulContext != nil else {
-                return .ignored(patientSafeResponse: nil)
+            guard extractedName != nil else {
+                return rejectedDecision
             }
         } else {
             guard interactionSummary != nil, evidenceQuote != nil else {
-                return .ignored(patientSafeResponse: nil)
+                return rejectedDecision
             }
         }
 
@@ -530,8 +565,8 @@ actor AppleFoundationModelsDecisionEngine: LLMDecisionEngine {
             emotionalContext: emotionalContext,
             followUpContext: followUpContext,
             retentionHint: retentionHint,
-            needsCaregiverReview: try content.value(Bool.self, forProperty: "needsCaregiverReview"),
-            patientSafeResponse: try cleaned(content.value(String?.self, forProperty: "patientSafeResponse"))
+            needsCaregiverReview: needsCaregiverReview,
+            patientSafeResponse: patientSafeResponse
         )
     }
 
@@ -579,7 +614,7 @@ actor AppleFoundationModelsDecisionEngine: LLMDecisionEngine {
             GenerationSchema.Property(name: "emotionalContext", description: "Brief emotional context, or null.", type: String?.self),
             GenerationSchema.Property(name: "followUpContext", description: "Gentle future reminder or follow-up context, or null.", type: String?.self),
             GenerationSchema.Property(name: "retentionHint", description: "shortTerm, recent, longTerm, or null.", type: String?.self),
-            GenerationSchema.Property(name: "needsCaregiverReview", description: "False for this patient-facing prototype.", type: Bool.self),
+            GenerationSchema.Property(name: "needsCaregiverReview", description: "True for weak person candidates or identities missing relationship/context.", type: Bool.self),
             GenerationSchema.Property(name: "patientSafeResponse", description: "A short spoken response for the patient, or null.", type: String?.self)
         ]
     )
@@ -616,7 +651,7 @@ actor AppleFoundationModelsDecisionEngine: LLMDecisionEngine {
             GenerationSchema.Property(name: "emotionalContext", description: "Brief emotional context, or null.", type: String?.self),
             GenerationSchema.Property(name: "followUpContext", description: "Gentle future reminder or follow-up context, or null.", type: String?.self),
             GenerationSchema.Property(name: "retentionHint", description: "shortTerm, recent, longTerm, or null.", type: String?.self),
-            GenerationSchema.Property(name: "needsCaregiverReview", description: "False for this patient-facing prototype.", type: Bool.self),
+            GenerationSchema.Property(name: "needsCaregiverReview", description: "True for weak person candidates or identities missing relationship/context.", type: Bool.self),
             GenerationSchema.Property(name: "patientSafeResponse", description: "A short spoken response for the patient, or null.", type: String?.self)
         ]
     )

@@ -8,18 +8,43 @@
 import Combine
 import Foundation
 
+enum DemoPersonStatus: String, Equatable {
+    case draft
+    case approved
+    case rejected
+
+    var displayName: String {
+        rawValue.capitalized
+    }
+}
+
+enum DemoRecognitionStatus: String, Equatable {
+    case unverified
+    case approvedForRecognition
+}
+
 struct DemoPersonMemory: Identifiable, Equatable {
     let id: String
     var name: String
     var relationship: String
     var helpfulContext: String
-    var transcript: String
+    var patientPrompt: String
+    var transcriptEvidence: [String]
     var faceProfileId: String?
     var faceCaptureConfidence: Double?
     var caregiverApproved: Bool
-    var recognitionStatus: String
-    var status: String
+    var recognitionStatus: DemoRecognitionStatus
+    var status: DemoPersonStatus
     var needsCaregiverReview: Bool
+    var createdAt: Date
+    var updatedAt: Date
+    var approvedAt: Date?
+    var rejectedAt: Date?
+    var reviewedBy: String?
+
+    var transcript: String {
+        transcriptEvidence.joined(separator: "\n\n")
+    }
 }
 
 struct InteractionMemory: Identifiable, Equatable {
@@ -33,6 +58,47 @@ struct InteractionMemory: Identifiable, Equatable {
     var transcript: String
     var faceProfileId: String?
     var createdAt: Date
+}
+
+struct PersonProfileDisplay: Equatable {
+    let personId: String
+    let faceProfileId: String
+    let name: String
+    let relationship: String
+    let memoryCue: String
+    let detailLines: [String]
+}
+
+enum PersonProfileDisplayResult: Equatable {
+    case known(PersonProfileDisplay)
+    case unknown(String)
+
+    var title: String {
+        switch self {
+        case .known:
+            "Remembered"
+        case .unknown:
+            "Face detected"
+        }
+    }
+
+    var description: String {
+        switch self {
+        case let .known(profile):
+            profile.memoryCue
+        case let .unknown(message):
+            message
+        }
+    }
+
+    var detailLines: [String] {
+        switch self {
+        case let .known(profile):
+            profile.detailLines
+        case .unknown:
+            []
+        }
+    }
 }
 
 @MainActor
@@ -59,14 +125,20 @@ protocol MemoryBridge: AnyObject {
     func recognizeApprovedPerson(faceProfileId: String) -> String
     func profileDisplay(for faceProfileId: String) -> PersonProfileDisplayResult
     func approvePersonEnrollment(personId: String, caregiverName: String)
+    func rejectPersonEnrollment(personId: String, caregiverName: String)
+    func allPeople() -> [DemoPersonMemory]
+    func recentInteractions() -> [InteractionMemory]
     func pendingDraftPeople() -> [DemoPersonMemory]
+    func approvedPeople() -> [DemoPersonMemory]
+    func searchPeople(query: String) -> [DemoPersonMemory]
+    func wikiPage(for personId: String) -> String?
     func memoryWikiMarkdown() -> String
 }
 
 @MainActor
 final class MockMemoryBridge: ObservableObject, MemoryBridge {
     private enum DemoPerson {
-        static let unknownResponse = "I see someone nearby, but I do not know who they are yet."
+        static let cautiousUnknownResponse = "Unknown face"
     }
 
     @Published private(set) var people: [DemoPersonMemory] = []
@@ -86,21 +158,61 @@ final class MockMemoryBridge: ObservableObject, MemoryBridge {
         }
 
         let personId = stablePersonId(for: name, faceProfileId: faceProfileId)
+        let relationship = clean(extractedRelationship, fallback: "Unknown")
+        let helpfulContext = clean(extractedHelpfulContext, fallback: "Not captured yet")
+        let prompt = patientPrompt(
+            name: name,
+            relationship: relationship,
+            helpfulContext: helpfulContext
+        )
+        let evidenceEntries = transcriptEvidenceEntries(from: transcript)
+        let now = Date()
+
+        if let index = people.firstIndex(where: { $0.id == personId }) {
+            people[index].name = name
+            people[index].relationship = relationship
+            people[index].helpfulContext = helpfulContext
+            people[index].patientPrompt = prompt
+            for evidenceEntry in evidenceEntries {
+                appendTranscriptEvidence(evidenceEntry, to: index)
+            }
+            people[index].faceProfileId = faceProfileId
+            people[index].faceCaptureConfidence = confidence
+            people[index].updatedAt = now
+
+            if people[index].status != .approved {
+                people[index].caregiverApproved = false
+                people[index].recognitionStatus = .unverified
+                people[index].status = .draft
+                people[index].needsCaregiverReview = true
+                people[index].approvedAt = nil
+                people[index].rejectedAt = nil
+                people[index].reviewedBy = nil
+            }
+
+            return people[index]
+        }
+
         let draft = DemoPersonMemory(
             id: personId,
             name: name,
-            relationship: clean(extractedRelationship, fallback: "possible acquaintance"),
-            helpfulContext: clean(extractedHelpfulContext, fallback: "No helpful context captured yet."),
-            transcript: transcript,
+            relationship: relationship,
+            helpfulContext: helpfulContext,
+            patientPrompt: prompt,
+            transcriptEvidence: evidenceEntries,
             faceProfileId: faceProfileId,
             faceCaptureConfidence: confidence,
-            caregiverApproved: true,
-            recognitionStatus: "availableForRecall",
-            status: "saved",
-            needsCaregiverReview: false
+            caregiverApproved: false,
+            recognitionStatus: .unverified,
+            status: .draft,
+            needsCaregiverReview: true,
+            createdAt: now,
+            updatedAt: now,
+            approvedAt: nil,
+            rejectedAt: nil,
+            reviewedBy: nil
         )
 
-        people.removeAll { $0.id == draft.id }
         people.append(draft)
         return draft
     }
@@ -139,42 +251,23 @@ final class MockMemoryBridge: ObservableObject, MemoryBridge {
     }
 
     func recognizeApprovedPerson(faceProfileId: String) -> String {
-        let recentInteraction = interactions.first { $0.faceProfileId == faceProfileId }
-
-        guard let person = people.first(where: {
-            $0.faceProfileId == faceProfileId &&
-                $0.recognitionStatus == "availableForRecall" &&
-                $0.status == "saved"
-        }) else {
-            if let recentInteraction {
-                return patientPrompt(for: recentInteraction)
-            }
-
-            return DemoPerson.unknownResponse
+        guard let person = approvedPerson(for: faceProfileId) else {
+            return DemoPerson.cautiousUnknownResponse
         }
 
-        if let recentInteraction {
-            return "\(patientPrompt(for: person)) Last time, \(recentInteraction.summary.lowercasedFirstLetter())"
+        if let recentInteraction = interactions.first(where: { $0.faceProfileId == faceProfileId }) {
+            return "\(person.patientPrompt) Last time, \(recentInteraction.summary.lowercasedFirstLetter())"
         }
 
-        return patientPrompt(for: person)
+        return person.patientPrompt
     }
 
     func profileDisplay(for faceProfileId: String) -> PersonProfileDisplayResult {
-        let recentInteraction = interactions.first { $0.faceProfileId == faceProfileId }
-
-        guard let person = people.first(where: {
-            $0.faceProfileId == faceProfileId &&
-                $0.recognitionStatus == "availableForRecall" &&
-                $0.status == "saved"
-        }) else {
-            if let recentInteraction {
-                return .unknown(patientPrompt(for: recentInteraction))
-            }
-
-            return .unknown(DemoPerson.unknownResponse)
+        guard let person = approvedPerson(for: faceProfileId) else {
+            return .unknown(DemoPerson.cautiousUnknownResponse)
         }
 
+        let recentInteraction = interactions.first { $0.faceProfileId == faceProfileId }
         let detailLines = profileDetailLines(for: person, recentInteraction: recentInteraction)
         return .known(
             PersonProfileDisplay(
@@ -190,24 +283,96 @@ final class MockMemoryBridge: ObservableObject, MemoryBridge {
 
     func approvePersonEnrollment(personId: String, caregiverName: String) {
         guard let index = people.firstIndex(where: { $0.id == personId }) else { return }
+        let now = Date()
         people[index].caregiverApproved = true
-        people[index].recognitionStatus = "availableForRecall"
-        people[index].status = "saved"
+        people[index].recognitionStatus = .approvedForRecognition
+        people[index].status = .approved
         people[index].needsCaregiverReview = false
+        people[index].updatedAt = now
+        people[index].approvedAt = now
+        people[index].rejectedAt = nil
+        people[index].reviewedBy = caregiverName
+        people[index].patientPrompt = patientPrompt(for: people[index])
+    }
+
+    func rejectPersonEnrollment(personId: String, caregiverName: String) {
+        guard let index = people.firstIndex(where: { $0.id == personId }) else { return }
+        let now = Date()
+        people[index].caregiverApproved = false
+        people[index].recognitionStatus = .unverified
+        people[index].status = .rejected
+        people[index].needsCaregiverReview = false
+        people[index].updatedAt = now
+        people[index].approvedAt = nil
+        people[index].rejectedAt = now
+        people[index].reviewedBy = caregiverName
+    }
+
+    func allPeople() -> [DemoPersonMemory] {
+        people.sorted { $0.updatedAt > $1.updatedAt }
+    }
+
+    func recentInteractions() -> [InteractionMemory] {
+        interactions.sorted { $0.createdAt > $1.createdAt }
     }
 
     func pendingDraftPeople() -> [DemoPersonMemory] {
-        people.filter { $0.status == "draft" || $0.needsCaregiverReview }
+        people.filter { $0.status == .draft || $0.needsCaregiverReview }
+            .sorted { $0.updatedAt > $1.updatedAt }
+    }
+
+    func approvedPeople() -> [DemoPersonMemory] {
+        people.filter {
+            $0.status == .approved &&
+                $0.caregiverApproved &&
+                $0.recognitionStatus == .approvedForRecognition
+        }
+        .sorted { $0.updatedAt > $1.updatedAt }
+    }
+
+    func searchPeople(query: String) -> [DemoPersonMemory] {
+        let normalizedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !normalizedQuery.isEmpty else {
+            return people.sorted { $0.updatedAt > $1.updatedAt }
+        }
+
+        return people
+            .filter { person in
+                [
+                    person.name,
+                    person.relationship,
+                    person.helpfulContext,
+                    person.patientPrompt
+                ].contains { $0.localizedCaseInsensitiveContains(normalizedQuery) } ||
+                    person.transcriptEvidence.contains { $0.localizedCaseInsensitiveContains(normalizedQuery) }
+            }
+            .sorted { $0.updatedAt > $1.updatedAt }
+    }
+
+    func wikiPage(for personId: String) -> String? {
+        guard let person = people.first(where: { $0.id == personId }) else { return nil }
+        return markdownPage(for: person)
     }
 
     func memoryWikiMarkdown() -> String {
         guard !people.isEmpty || !interactions.isEmpty else {
-            return "# MindAnchor Memory Wiki\n\nNo person memories yet."
+            return "# MindAnchor Memory Wiki\n\nNo memories yet."
         }
 
-        let personPages = people.map(markdownPage(for:))
+        let personPages = people
+            .sorted { $0.updatedAt > $1.updatedAt }
+            .map(markdownPage(for:))
         let interactionPages = interactions.map(markdownPage(for:))
         return (personPages + interactionPages).joined(separator: "\n\n---\n\n")
+    }
+
+    private func approvedPerson(for faceProfileId: String) -> DemoPersonMemory? {
+        people.first {
+            $0.faceProfileId == faceProfileId &&
+                $0.caregiverApproved &&
+                $0.recognitionStatus == .approvedForRecognition &&
+                $0.status == .approved
+        }
     }
 
     private func stablePersonId(for name: String, faceProfileId: String) -> String {
@@ -243,21 +408,49 @@ final class MockMemoryBridge: ObservableObject, MemoryBridge {
         return cleaned
     }
 
+    private func transcriptEvidenceEntries(from transcript: String) -> [String] {
+        let entries = transcript
+            .components(separatedBy: .newlines)
+            .map(Self.cleanEvidenceQuote(_:))
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines.union(.punctuationCharacters)) }
+            .filter { !$0.isEmpty }
+
+        let uniqueEntries = entries.reduce(into: [String]()) { result, entry in
+            guard !result.contains(entry) else { return }
+            result.append(entry)
+        }
+
+        return uniqueEntries.isEmpty ? ["No transcript evidence captured."] : uniqueEntries
+    }
+
     private func cleanOptional(_ value: String?) -> String? {
         let cleaned = value?.trimmingCharacters(in: .whitespacesAndNewlines)
         return cleaned?.isEmpty == false ? cleaned : nil
     }
 
-    private func patientPrompt(for person: DemoPersonMemory) -> String {
-        let context = person.helpfulContext == "No helpful context captured yet."
-            ? ""
-            : " \(person.name) \(person.helpfulContext)."
+    private func appendTranscriptEvidence(_ transcript: String, to index: Int) {
+        guard !people[index].transcriptEvidence.contains(transcript) else { return }
+        people[index].transcriptEvidence.append(transcript)
+    }
 
-        if person.relationship == "person I met" || person.relationship == "possible acquaintance" {
-            return "This is \(person.name).\(context)"
+    private func patientPrompt(for person: DemoPersonMemory) -> String {
+        patientPrompt(
+            name: person.name,
+            relationship: person.relationship,
+            helpfulContext: person.helpfulContext
+        )
+    }
+
+    private func patientPrompt(name: String, relationship: String, helpfulContext: String) -> String {
+        let context = helpfulContext == "No helpful context captured yet." || helpfulContext == "Not captured yet"
+            ? ""
+            : " \(helpfulContext.asPatientPromptSentenceWithPronoun)"
+
+        if relationship == "person I met" || relationship == "possible acquaintance" || relationship == "Unknown" {
+            return "This is \(name).\(context)"
         }
 
-        return "This is \(person.name), your \(person.relationship).\(context)"
+        return "This is \(name), your \(relationship).\(context)"
     }
 
     private func patientPrompt(for interaction: InteractionMemory) -> String {
@@ -271,11 +464,12 @@ final class MockMemoryBridge: ObservableObject, MemoryBridge {
     private func profileDetailLines(for person: DemoPersonMemory, recentInteraction: InteractionMemory?) -> [String] {
         var lines: [String] = []
 
-        if person.relationship != "person I met", person.relationship != "possible acquaintance" {
+        if person.relationship != "person I met", person.relationship != "possible acquaintance", person.relationship != "Unknown" {
             lines.append(person.relationship)
         }
 
         if person.helpfulContext != "No helpful context captured yet.",
+           person.helpfulContext != "Not captured yet",
            !person.helpfulContext.lowercased().contains("introduced during the conversation") {
             lines.append(person.helpfulContext)
         }
@@ -291,29 +485,40 @@ final class MockMemoryBridge: ObservableObject, MemoryBridge {
         """
         # \(person.name)
 
-        Status: \(person.status.capitalized)
-        Patient Facing: true
-        Recognition Status: \(person.recognitionStatus)
-        Trust Level: patientObserved
-        Ready for Recall: true
+        Status: \(person.status.displayName)
+        Caregiver Approved: \(person.caregiverApproved)
+        Recognition Status: \(person.recognitionStatus.rawValue)
+        Trust Level: \(person.caregiverApproved ? "caregiverApproved" : "aiObserved")
+        Needs Caregiver Review: \(person.needsCaregiverReview)
+        Created: \(Self.localDateTime.string(from: person.createdAt))
+        Updated: \(Self.localDateTime.string(from: person.updatedAt))
+        Reviewed By: \(person.reviewedBy ?? "Not reviewed")
+        Approved At: \(person.approvedAt.map(Self.localDateTime.string(from:)) ?? "Not approved")
+        Rejected At: \(person.rejectedAt.map(Self.localDateTime.string(from:)) ?? "Not rejected")
 
         ## Extracted Information
 
         Name: \(person.name)
         Relationship: \(person.relationship)
-        Helpful context: \(person.helpfulContext)
+        Helpful Context: \(person.helpfulContext)
+        Retention Hint: \(person.needsCaregiverReview ? "Incomplete identity. Caregiver should add relationship/context." : "Reviewed")
 
         ## Evidence
 
-        Transcript:
-        "\(person.transcript)"
+        \(transcriptEvidenceMarkdown(for: person))
+
+        Safety note:
+        Do not identify this person until caregiver approval.
 
         Face profile ID:
         \(person.faceProfileId ?? "None")
 
+        Face capture confidence:
+        \(person.faceCaptureConfidence.map { String(format: "%.2f", $0) } ?? "None")
+
         ## Patient Prompt
 
-        \(patientPrompt(for: person))
+        \(person.caregiverApproved ? person.patientPrompt : "Do not identify this person to the patient until caregiver approval.")
         """
     }
 
@@ -323,6 +528,7 @@ final class MockMemoryBridge: ObservableObject, MemoryBridge {
 
         Type: \(interaction.memoryType)
         Retention: \(interaction.retentionHint ?? "recent")
+        Created: \(Self.localDateTime.string(from: interaction.createdAt))
         Face profile ID: \(interaction.faceProfileId ?? "None")
 
         ## Summary
@@ -342,9 +548,51 @@ final class MockMemoryBridge: ObservableObject, MemoryBridge {
         "\(interaction.evidenceQuote)"
         """
     }
+
+    private func transcriptEvidenceMarkdown(for person: DemoPersonMemory) -> String {
+        person.transcriptEvidence
+            .enumerated()
+            .map { index, transcript in
+                "Evidence Quote \(index + 1):\n\"\(Self.cleanEvidenceQuote(transcript))\""
+            }
+            .joined(separator: "\n\n")
+    }
+
+    private static func cleanEvidenceQuote(_ transcript: String) -> String {
+        transcript.replacingOccurrences(
+            of: #"^\[\d{2}:\d{2}\]\s*(?:Speaker\s+[A-Z]|Conversation):\s*"#,
+            with: "",
+            options: .regularExpression
+        )
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static let localDateTime: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .short
+        return formatter
+    }()
 }
 
 private extension String {
+    var asPatientPromptSentenceWithPronoun: String {
+        let trimmed = trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "" }
+
+        let lowercased = trimmed.lowercased()
+        let sentence = lowercased.hasPrefix("she ") || lowercased.hasPrefix("he ") || lowercased.hasPrefix("they ")
+            ? trimmed
+            : "She \(trimmed)"
+
+        let terminalPunctuation = CharacterSet(charactersIn: ".!?")
+        if sentence.rangeOfCharacter(from: terminalPunctuation, options: .backwards)?.upperBound == sentence.endIndex {
+            return sentence
+        }
+
+        return "\(sentence)."
+    }
+
     func lowercasedFirstLetter() -> String {
         guard let first else { return self }
         return first.lowercased() + dropFirst()

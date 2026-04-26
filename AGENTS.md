@@ -1,633 +1,261 @@
+# MindAnchor Agent Instructions
 
-# MindAnchor Agent Instructions — Focused Person Memory Demo
+## Product Direction
 
-## Product Summary
+MindAnchor is a privacy-first, local memory companion for people with early memory loss.
 
-MindAnchor is a privacy-first memory companion for people with early memory loss.
+The active prototype is a focused SwiftUI/Xcode demo:
 
-This prototype is focused on one clear demo:
-
-> The patient meets someone they do not remember. MindAnchor listens to the conversation, extracts who the person is, stores a draft memory page, asks the caregiver to approve it, and later recognizes the same person to remind the patient who they are.
+- The patient camera screen is the main experience.
+- Apple Vision detects whether a face is in frame.
+- Speech transcription starts only while a face is bounded.
+- Transcript snapshots are sent to a memory coordinator.
+- An LLM decision engine decides whether the conversation contains important memory information.
+- Important person memories are stored locally as draft memories.
+- Patient Mode stays quiet: no tabs, no buttons, no raw transcript, no wiki popup.
+- When a memory is being written, show only a small temporary green top-right chip such as `Saving` then `Saved`.
 
 Core principle:
 
-- Patient Mode is calm and voice-first.
-- Caregiver Mode is the trusted review and approval surface.
-- The memory wiki is the private local source of truth.
-- Face/speech model outputs are treated as local evidence.
-- Identity is never shown as trusted until caregiver approval.
+- Patient Mode is calm, voice-first, and camera-first.
+- The memory wiki/storage layer is the private local source of truth.
+- Face detection means only “a face is present,” not “this person is Maya.”
+- Identity should never be presented as trusted without caregiver approval.
 
-This is a quick hackathon prototype. Keep it simple, local, and demo-ready.
+Keep the project simple, local, and demo-ready.
 
----
+## Current App Structure
 
-## Current Prototype Scope
+Important Swift files:
 
-The current demo should focus on:
+- `LAHACKS26/ContentView.swift`
+- `LAHACKS26/Views/PatientCameraView.swift`
+- `LAHACKS26/ViewModels/PatientCameraViewModel.swift`
+- `LAHACKS26/Models/FaceDetectionResult.swift`
+- `LAHACKS26/Services/CameraManager.swift`
+- `LAHACKS26/Services/VisionFaceDetectionService.swift`
+- `LAHACKS26/Services/AppleSpeechTranscriptionService.swift`
+- `LAHACKS26/Services/SpeechTranscriptionService.swift`
+- `LAHACKS26/Services/ZeticWhisperTranscriptionService.swift`
+- `LAHACKS26/Services/LLMDecisionEngine.swift`
+- `LAHACKS26/Services/MemoryCoordinator.swift`
+- `LAHACKS26/Services/MemoryBridge.swift`
+- `LAHACKS26/Services/TextToSpeechService.swift`
 
-1. Person learning from conversation
-2. Draft person memory creation
-3. Caregiver approval
-4. Later recognition using a mocked local face profile ID
-5. A readable memory wiki page for the learned person
+`ContentView` should keep showing `PatientCameraView` as the primary app surface.
 
-Allowed:
+`PatientCameraView` owns the quiet patient experience:
 
-- SwiftUI frontend
-- Local Swift mock memory store / memory bridge
-- Conversation transcript input or simulated speech transcript
-- Mock face profile ID, such as `face-maya-001`
-- Apple Vision face detection bounding boxes if already available
-- ZETIC/Melange adapter stubs if useful
-- Text-to-speech for patient-facing responses
-- Caregiver approval UI
-- Memory wiki demo view
+- rear camera preview
+- single polished face bounding box
+- face-gated speech transcription
+- calls into `MemoryCoordinator`
+- optional patient-safe text-to-speech response
+- temporary top-right green save chip
 
-Do not add unless explicitly requested:
+`MemoryCoordinator` owns the memory-capture pipeline:
 
-- Cloud sync
-- Authentication
-- Production database
-- Medical diagnosis claims
-- Emergency dispatch
-- Full dementia assessment
-- Large unrelated features like object recall, medication tracking, or full daily planning
-- Real biometric identity claims without caregiver approval
+- starts and ends face-bound conversations
+- accepts transcript updates
+- debounces Apple Speech partial transcripts into stable snapshots
+- prints transcript and LLM decisions to the console during testing
+- runs live, reconciliation, and final LLM passes
+- stores memory only when the decision engine says it is important enough
+- publishes `MemoryCoordinatorEvent` for `Saving` and `Saved` UI chips
 
-Everything should remain local/in-memory unless explicitly requested otherwise.
+`MemoryBridge` owns local in-memory storage only.
 
----
+`LLMDecisionEngine` owns transcript analysis. Do not move LLM-ish parsing back into `MockMemoryBridge`.
 
-## Main Demo Flow
+## Patient Camera Requirements
 
-The demo should show this exact story:
+Patient Mode must remain minimal.
 
-### Scene 1: First Conversation
+Allowed on the patient camera screen:
 
-Patient is talking to a person they do not know.
+- rear camera feed
+- face bounding box
+- calm camera permission/fallback message
+- small temporary top-right green chip when saving/noted
 
-Transcript:
+Not allowed on the patient camera screen unless explicitly requested:
+
+- bottom tabs
+- manual capture buttons
+- raw transcript panels
+- markdown/wiki popups
+- debug JSON
+- caregiver review controls
+- long instructional text
+
+Speech transcription should only run while a face is being bounded. Keep the gate tolerant enough that brief detection flicker does not constantly start and stop transcription.
+
+## Face Pipeline
+
+Current milestone is face detection only.
+
+Use Apple Vision for detection:
+
+- `VNDetectFaceRectanglesRequest`
+- rear camera only
+- preview uses aspect fill
+- draw one polished bounding box for the best/current face
+
+Important:
+
+- Face detection is not face recognition.
+- Do not claim identity from Vision face detection.
+- The current `faceProfileId` is a mocked local placeholder for future enrollment/recognition.
+- If rear camera is unavailable, show a calm fallback message.
+
+## Speech Pipeline
+
+Use Apple Speech framework for the working prototype:
+
+- `SFSpeechRecognizer`
+- `AVAudioEngine`
+- `SFSpeechAudioBufferRecognitionRequest`
+- live partial transcripts
+
+Keep `ZeticWhisperTranscriptionService` as a compile-safe stub for the future ZETIC Melange Whisper path:
+
+- Audio -> Whisper feature extractor -> encoder -> decoder -> transcript
+- Keep the transcript interface swappable with Apple Speech.
+- Do not add broken ZETIC imports if the SDK is unavailable.
+
+## LLM-Coordinated Memory Capture
+
+The correct architecture is:
 
 ```txt
-Hi, I'm Maya. I'm your neighbor from next door. I usually help bring in your mail.
-````
-
-MindAnchor extracts:
-
-* Name: Maya
-* Relationship: neighbor from next door
-* Helpful context: usually helps bring in your mail
-* Face profile ID: `face-maya-001`
-
-MindAnchor creates a draft person memory.
-
-Patient-facing response before approval:
-
-```txt
-I learned a possible new person. A caregiver needs to approve this memory before I identify them for you.
+Rear camera face detection
+  -> face-gated Apple Speech transcription
+  -> stable transcript snapshots
+  -> MemoryCoordinator
+  -> LLMDecisionEngine
+  -> local MemoryBridge storage if important
+  -> temporary Saved chip
 ```
 
----
+Do not use simple pattern matching as the primary decision for whether to store memory. The LLM decision engine should decide whether a transcript is important.
 
-### Scene 2: Caregiver Review
+The current decision model includes:
 
-Caregiver sees a draft card:
+- `TranscriptAnalysisDecision`
+- `MemoryType`
+- `MemoryImportance`
+- `ConversationState`
+- `ConversationAnalysisResult`
+- timestamped transcript segments
 
-```txt
-Maya
-Possible relationship: neighbor from next door
-Helpful context: helps bring in your mail
-Evidence: conversation transcript
-Face profile: face-maya-001
-Status: Needs approval
-```
+The coordinator should use a hybrid streaming plus consolidation flow:
 
-Caregiver taps:
+- Fast live layer: update provisional conversation state every few seconds.
+- Reconciliation layer: periodically revisit recent context.
+- Final layer: run when the face-bound conversation ends.
 
-```txt
-Approve
-```
+Live LLM outputs are provisional. Final storage should happen from reconciliation or final decisions, not from every partial speech result.
 
-The person becomes approved for recognition.
+For testing, console logging should include:
 
----
+- transcript snapshots
+- live/reconciliation/final decisions
+- conversation state JSON
+- memory saved messages
 
-### Scene 3: Later Recognition
+## Storage Rules
 
-Patient meets the same person again.
+Store person memory only when the LLM decision is strong enough.
 
-The app receives or simulates:
+Expected important examples:
 
-```txt
-faceProfileId = face-maya-001
-```
+- `This is Akshay. He is my grandson.`
+- `Hi, I'm Maya. I'm your neighbor from next door. I usually help bring in your mail.`
+- `My name is Maya. I live next door.`
 
-If Maya is approved, the app speaks/displays:
+Expected unimportant examples:
 
-```txt
-This is Maya, your neighbor from next door. She helps bring in your mail.
-```
+- `Hey`
+- `How are you?`
+- `Nice weather today.`
+- short small talk with no durable identity, relationship, routine, or object fact
 
-If Maya is not approved yet, the app must say:
+Draft person memories should remain local/in-memory for now.
+
+Draft identity memory should use safe defaults:
+
+- caregiver approval required
+- recognition unverified
+- not trusted as a patient-facing identity yet
+
+Unapproved recognition must return a safe response:
 
 ```txt
 I see someone nearby, but I do not have a caregiver-approved identity for them yet.
 ```
 
----
+Approved recognition can return a patient-safe identity prompt, for example:
 
-## Product Safety Rules
+```txt
+This is Maya, your neighbor from next door. She helps bring in your mail.
+```
+
+## Save Chip Behavior
+
+When the coordinator is actually saving a memory:
+
+- publish a `MemoryCoordinatorEvent` with title `Saving`
+- show the small green top-right chip
+- after local storage succeeds, publish title `Saved`
+- hide the chip after a short delay
+
+Do not show a permanent “saved draft memory” widget. Do not show the wiki on top of the camera screen.
+
+## Trust And Safety
 
 Never identify a person as trusted before caregiver approval.
 
 Do not say:
 
-```txt
-This is Maya.
-```
+- `This is Maya.`
+- `You can trust this person.`
+- `This person is safe.`
 
-unless:
-
-* the person memory is approved
-* caregiverApproved is true
-* recognitionStatus is approvedForRecognition
-
-Before approval, say:
-
-```txt
-I see someone nearby, but I do not have a caregiver-approved identity for them yet.
-```
+unless the memory is caregiver-approved and approved for recognition.
 
 Do not make medical claims.
 
 Do not say:
 
-* “You are having a dementia episode.”
-* “This proves memory decline.”
-* “This person is safe” before caregiver approval.
-* “You can trust this person” unless caregiver approved.
+- `You are having a dementia episode.`
+- `This proves memory decline.`
+- `This person is safe` before caregiver approval.
 
 Patient-facing language should be:
 
-* short
-* calm
-* spoken clearly
-* non-clinical
-* reassuring
-
----
-
-## Memory Wiki Concept
-
-The memory wiki is the local source of truth.
-
-For this focused demo, the wiki only needs to store:
-
-* People
-* Conversation evidence
-* Face profile IDs
-* Approval state
-* Recognition state
-
-The patient should not see raw markdown.
-
-The caregiver/demo view can show a readable “memory wiki” page.
-
-Example draft page:
-
-```md
-# Maya
-
-Status: Draft
-Caregiver Approved: false
-Recognition Status: unverified
-Trust Level: aiObserved
-Needs Caregiver Review: true
-
-## Extracted Information
-
-Name: Maya
-Relationship: neighbor from next door
-Helpful context: helps bring in your mail
-
-## Evidence
-
-Transcript:
-“Hi, I'm Maya. I'm your neighbor from next door. I usually help bring in your mail.”
-
-Face profile ID:
-face-maya-001
-
-## Safety
-
-Do not identify this person to the patient until caregiver approval.
-```
-
-Example approved page:
-
-```md
-# Maya
-
-Status: Approved
-Caregiver Approved: true
-Recognition Status: approvedForRecognition
-Trust Level: caregiverApproved
-
-## Relationship
-
-Neighbor from next door.
-
-## Helpful Context
-
-Maya usually helps bring in the mail.
-
-## Patient Prompt
-
-This is Maya, your neighbor from next door. She helps bring in your mail.
-
-## Evidence
-
-Originally introduced in conversation.
-Approved by caregiver.
-Face profile ID: face-maya-001
-```
-
----
-
-## Data Model
-
-Create or maintain a person memory model like:
-
-```swift
-struct PersonMemory: Identifiable {
-    let id: String
-    var name: String
-    var relationship: String
-    var helpfulContext: String
-    var patientPrompt: String
-    var transcriptEvidence: [String]
-    var faceProfileId: String?
-    var voiceProfileId: String?
-    var status: PersonStatus
-    var caregiverApproved: Bool
-    var recognitionStatus: RecognitionStatus
-    var trustLevel: TrustLevel
-    var createdAt: Date
-    var updatedAt: Date
-}
-```
-
-Suggested enums:
-
-```swift
-enum PersonStatus {
-    case draft
-    case approved
-    case rejected
-}
-
-enum RecognitionStatus {
-    case unverified
-    case approvedForRecognition
-}
-
-enum TrustLevel {
-    case caregiverApproved
-    case aiObserved
-    case patientReported
-}
-```
-
-Enrollment session model:
-
-```swift
-struct PersonEnrollmentSession: Identifiable {
-    let id: String
-    var transcript: String
-    var extractedName: String?
-    var extractedRelationship: String?
-    var extractedHelpfulContext: String?
-    var faceProfileId: String?
-    var faceConfidence: Double?
-    var draftPersonId: String?
-    var status: EnrollmentStatus
-    var createdAt: Date
-    var updatedAt: Date
-}
-```
-
-Suggested enum:
-
-```swift
-enum EnrollmentStatus {
-    case collectingEvidence
-    case draftCreated
-    case caregiverReview
-    case approved
-    case rejected
-}
-```
-
----
-
-## Required Memory Bridge
-
-If this branch is SwiftUI-only, implement a local Swift memory bridge.
-
-Use a protocol like:
-
-```swift
-protocol MemoryBridge {
-    func startPersonEnrollmentSession() -> String
-
-    func addConversationTranscript(
-        sessionId: String,
-        transcript: String
-    )
-
-    func attachFaceProfile(
-        sessionId: String,
-        faceProfileId: String,
-        confidence: Double
-    )
-
-    func createDraftPersonMemory(
-        sessionId: String
-    ) -> String?
-
-    func approvePerson(
-        personId: String,
-        caregiverName: String
-    )
-
-    func rejectPerson(
-        personId: String,
-        caregiverName: String
-    )
-
-    func recognizePersonByFaceProfile(
-        faceProfileId: String
-    ) -> PatientRecognitionResult
-
-    func getCaregiverReviewQueue() -> [PersonMemory]
-
-    func getPersonWikiPage(
-        personId: String
-    ) -> String
-}
-```
-
-Result model:
-
-```swift
-struct PatientRecognitionResult {
-    let spokenResponse: String
-    let displayText: String
-    let recognizedPersonId: String?
-    let caregiverApproved: Bool
-}
-```
-
-Implement `MockMemoryBridge` locally for the demo.
-
----
-
-## Required Functions
-
-The app should support these operations:
-
-### 1. Start Enrollment
-
-```swift
-let sessionId = memoryBridge.startPersonEnrollmentSession()
-```
-
-Creates a new person enrollment session.
-
----
-
-### 2. Add Conversation Transcript
-
-```swift
-memoryBridge.addConversationTranscript(
-    sessionId: sessionId,
-    transcript: "Hi, I'm Maya. I'm your neighbor from next door. I usually help bring in your mail."
-)
-```
-
-For the MVP, extraction can be rule-based.
-
-It should detect:
-
-* `I'm Maya`
-* `my name is Maya`
-* `I'm your neighbor`
-* `neighbor from next door`
-* `help bring in your mail`
-
-Expected extraction:
-
-```txt
-Name: Maya
-Relationship: neighbor from next door
-Helpful context: helps bring in your mail
-```
-
-No real LLM is required for this prototype, but the logic should be shaped so a future LLM extractor can replace the rules.
-
----
-
-### 3. Attach Face Profile
-
-```swift
-memoryBridge.attachFaceProfile(
-    sessionId: sessionId,
-    faceProfileId: "face-maya-001",
-    confidence: 0.88
-)
-```
-
-For MVP, the face profile ID can be mocked.
-
-If Apple Vision/ZETIC face detection exists, use it only to detect a face and trigger profile capture. Do not claim real biometric recognition unless implemented.
-
----
-
-### 4. Create Draft Person
-
-```swift
-let personId = memoryBridge.createDraftPersonMemory(sessionId: sessionId)
-```
-
-Creates draft `PersonMemory`.
-
-Draft person memory must use:
-
-* `status: .draft`
-* `trustLevel: .aiObserved`
-* `caregiverApproved: false`
-* `recognitionStatus: .unverified`
-
----
-
-### 5. Approve Person
-
-```swift
-memoryBridge.approvePerson(
-    personId: personId,
-    caregiverName: "Anita"
-)
-```
-
-Approved person memory must use:
-
-* `status: .approved`
-* `trustLevel: .caregiverApproved`
-* `caregiverApproved: true`
-* `recognitionStatus: .approvedForRecognition`
-
----
-
-### 6. Recognize Later
-
-```swift
-let result = memoryBridge.recognizePersonByFaceProfile(
-    faceProfileId: "face-maya-001"
-)
-```
-
-If approved, return:
-
-```txt
-This is Maya, your neighbor from next door. She helps bring in your mail.
-```
-
-If not approved, return:
-
-```txt
-I see someone nearby, but I do not have a caregiver-approved identity for them yet.
-```
-
----
-
-## Frontend Screens
-
-Build the frontend around three simple screens or sections.
-
-### 1. Conversation Capture Screen
-
-Purpose:
-
-* Simulate or capture the first conversation.
-* Extract person information.
-* Create a draft memory.
-
-Should include:
-
-* camera preview or camera placeholder
-* transcript input or demo transcript button
-* extracted info preview
-* button: “Create Draft Memory”
-* status message: “Needs caregiver approval”
-
-Demo transcript button should insert:
-
-```txt
-Hi, I'm Maya. I'm your neighbor from next door. I usually help bring in your mail.
-```
-
----
-
-### 2. Caregiver Review Screen
-
-Purpose:
-
-* Show draft person memories.
-* Approve or reject them.
-
-Should include:
-
-* draft person card
-* name
-* relationship
-* helpful context
-* transcript evidence
-* face profile ID
-* approve button
-* reject button
-
----
-
-### 3. Later Recognition Screen
-
-Purpose:
-
-* Simulate the later conversation.
-* Recognize the same local face profile.
-* Retrieve the approved person memory.
-
-Should include:
-
-* camera preview or placeholder
-* button: “Simulate Maya recognized”
-* patient-facing response overlay
-* text-to-speech response if available
-
-Before approval, this screen should return the safe unapproved response.
-
-After approval, it should return Maya’s approved prompt.
-
----
-
-### 4. Memory Wiki View
-
-Purpose:
-
-* Show the generated person wiki page.
-* Make the LLM wiki idea visible to judges.
-
-Should show:
-
-* draft wiki page before approval
-* approved wiki page after approval
-* transcript evidence
-* face profile ID
-* approval state
-* recognition state
-
-This view is caregiver/demo-facing only.
-
----
-
-## Camera / Face Detection Direction
-
-For the quick demo, face recognition can be mocked.
-
-Minimum:
-
-* Use a camera preview or placeholder.
-* Use Apple Vision face detection if already available.
-* Draw a polished face bounding box if a face is detected.
-* Create a mocked face profile ID when the user taps a demo button.
-
-Preferred first technical milestone:
-
-```txt
-Rear camera feed
-→ Apple Vision face detection bounding box
-→ mocked faceProfileId
-→ enrollment session
-→ caregiver approval
-→ later recognition by same faceProfileId
-```
-
-Important:
-
-* Face detection is not face recognition.
-* Do not claim actual identity matching unless implemented.
-* The mock `faceProfileId` is acceptable for hackathon demo if clearly framed as a local profile placeholder.
-
----
+- short
+- calm
+- spoken clearly
+- non-clinical
+- reassuring
+
+## Scope Boundaries
+
+Do not add unless explicitly requested:
+
+- cloud sync
+- authentication
+- production database
+- Express/API server
+- full caregiver UI
+- bottom-tab navigation
+- object recall
+- medication tracking
+- emergency dispatch
+- medical diagnosis claims
+- production ZETIC integration if the SDK is not ready
+
+Keep everything local/in-memory unless explicitly requested otherwise.
 
 ## UI Style
 
@@ -635,185 +263,55 @@ The app should feel native iOS, not like a debug screen.
 
 Use:
 
-* SwiftUI
-* translucent materials
-* rounded cards
-* capsules
-* SF Symbols
-* soft shadows
-* calm spacing
-* simple typography
+- SwiftUI
+- translucent materials where appropriate
+- capsules
+- SF Symbols
+- soft shadows
+- calm spacing
+- simple typography
 
 Avoid:
 
-* harsh debug rectangles
-* crowded buttons
-* raw JSON
-* raw logs
-* long text in patient mode
-* neon green debug boxes unless in debug mode
+- crowded controls
+- raw logs in Patient Mode
+- raw JSON in Patient Mode
+- long text in Patient Mode
+- permanent overlays
 
-Patient-facing UI should be minimal.
+## Build And Validation
 
-Caregiver/demo UI can show more details.
+After Swift changes, build with:
 
----
-
-## Text-to-Speech
-
-If implemented, use `AVSpeechSynthesizer`.
-
-Create a small service like:
-
-```swift
-final class TextToSpeechService {
-    func speak(_ text: String) {
-        // AVSpeechSynthesizer implementation
-    }
-}
+```bash
+xcodebuild -project LAHACKS26.xcodeproj -scheme LAHACKS26 -configuration Debug -destination 'generic/platform=iOS' -derivedDataPath /tmp/LAHACKS26DerivedData CODE_SIGNING_ALLOWED=NO build
 ```
 
-Use it when recognition returns a patient-facing prompt.
+Expected manual test flow:
 
-Speech should be calm and not too fast.
+1. Launch the app on a device.
+2. Point rear camera at a face.
+3. Confirm a face bounding box appears.
+4. Confirm transcription starts only while the face is bounded.
+5. Say: `This is Akshay. He is my grandson.`
+6. Watch console logs for transcript snapshots and LLM decisions.
+7. Confirm a temporary green `Saving` / `Saved` chip appears only when memory is stored.
+8. Confirm small talk like `How are you? Nice weather today.` does not store a memory.
 
----
+The simulator may emit CoreSimulator service warnings in sandboxed CLI builds. The important line is:
 
-## Demo Buttons
-
-For reliability, include demo buttons.
-
-Suggested buttons:
-
-Conversation Capture:
-
-* “Use Maya Transcript”
-* “Attach Face Profile”
-* “Create Draft Memory”
-
-Caregiver Review:
-
-* “Approve Maya”
-* “Reject Maya”
-
-Later Recognition:
-
-* “Simulate Maya Recognized”
-* “Ask Who Is This?”
-
-Memory Wiki:
-
-* “Show Draft Wiki”
-* “Show Approved Wiki”
-
----
-
-## Required Demo Script
-
-The app should support this sequence:
-
-1. Open Conversation Capture.
-2. Tap “Use Maya Transcript.”
-3. Tap “Attach Face Profile.”
-4. Tap “Create Draft Memory.”
-5. Show draft wiki page:
-
-   * Maya
-   * neighbor from next door
-   * helps bring in mail
-   * caregiver approved: false
-6. Go to Later Recognition.
-7. Tap “Simulate Maya Recognized” before approval.
-8. App says:
-
-   * “I see someone nearby, but I do not have a caregiver-approved identity for them yet.”
-9. Go to Caregiver Review.
-10. Tap “Approve Maya.”
-11. Go back to Later Recognition.
-12. Tap “Simulate Maya Recognized.”
-13. App says:
-
-* “This is Maya, your neighbor from next door. She helps bring in your mail.”
-
-14. Show approved wiki page.
-
----
-
-## ZETIC/Melange Direction
-
-ZETIC/Melange is part of the final sponsor story, but this focused demo can mock model outputs if needed.
-
-Use this explanation:
-
-* Speech model transcribes the conversation on-device.
-* Face detection/profile capture happens locally.
-* Extracted identity information is stored in a local memory wiki.
-* Caregiver approves the memory.
-* Later recognition retrieves the approved memory.
-
-If implementing stubs:
-
-```swift
-final class ZeticSpeechService {
-    func transcribeDemoAudio() -> String {
-        "Hi, I'm Maya. I'm your neighbor from next door. I usually help bring in your mail."
-    }
-}
+```txt
+** BUILD SUCCEEDED **
 ```
-
-```swift
-final class ZeticFaceProfileService {
-    func captureDemoFaceProfile() -> (faceProfileId: String, confidence: Double) {
-        ("face-maya-001", 0.88)
-    }
-}
-```
-
-If real Melange is unavailable, keep the app compiling with mocks and TODOs.
-
----
 
 ## Coding Style
 
-* Keep the demo simple.
-* Prefer a working mock over a broken real integration.
-* Keep views separate from memory logic.
-* Use protocols for services.
-* Keep all state local/in-memory.
-* Avoid overengineering.
-* Keep patient-facing text short.
-* Make approval state obvious.
-* Do not identify unapproved people.
-* Do not add unrelated features.
-
----
-
-## What Codex Should Do First
-
-Before coding, Codex should inspect the repo and determine:
-
-1. Whether an Xcode project exists.
-2. Which SwiftUI views currently exist.
-3. Whether there is already a camera manager.
-4. Whether there is already a memory bridge.
-5. Whether Apple Vision face detection is already partially implemented.
-6. Whether demo controls already exist.
-
-Then Codex should propose the smallest file changes to implement the focused person-memory demo.
-
-If no Xcode project exists, create documentation/stubs only and do not attempt to create a broken Xcode project unless explicitly asked.
-
----
-
-## Validation
-
-After changes:
-
-* Build the Xcode project if possible.
-* Keep the demo flow working.
-* Keep all memory local.
-* Do not introduce medical claims.
-* Do not identify anyone before approval.
-
-```
-```
+- Keep the demo simple.
+- Keep views separate from memory logic.
+- Use protocols for services.
+- Keep all state local/in-memory.
+- Avoid overengineering.
+- Keep patient-facing text short.
+- Do not identify unapproved people.
+- Do not add unrelated features.
+- Use `apply_patch` for manual edits.

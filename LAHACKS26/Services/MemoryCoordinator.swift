@@ -22,6 +22,34 @@ struct MemoryCoordinatorEvent: Identifiable, Equatable {
     let patientSafeResponse: String?
 }
 
+private struct RollingTranscriptFragment: Equatable {
+    let conversationID: UUID
+    var text: String
+    var updatedAt: Date
+}
+
+private struct RollingFaceConversationBuffer: Equatable {
+    var fragments: [RollingTranscriptFragment] = []
+    var conversationState: ConversationState = .empty
+    var lastUpdatedAt: Date = .distantPast
+
+    var combinedTranscript: String {
+        fragments
+            .map(\.text)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .joined(separator: "\n")
+    }
+
+    var combinedTranscriptForLogging: String {
+        fragments
+            .map(\.text)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines.union(.punctuationCharacters)) }
+            .filter { !$0.isEmpty }
+            .joined(separator: ". ")
+    }
+}
+
 @MainActor
 final class MemoryCoordinator: ObservableObject {
     @Published private(set) var latestEvent: MemoryCoordinatorEvent?
@@ -29,11 +57,15 @@ final class MemoryCoordinator: ObservableObject {
     private let memoryBridge: MemoryBridge
     private let decisionEngine: LLMDecisionEngine
     private let localExtractor = LocalEpisodicMemoryExtractor()
-    private let shouldUseLLMRefinement = false
+    private let capturePolicy = MemoryCapturePolicy()
+    private let shouldUseLLMRefinement = true
+    private let conversationMergeGraceWindow: TimeInterval = 24
     private var faceProfileId: String
     private let faceConfidence: Double
     private var isConversationActive = false
     private var conversationStartedAt: Date?
+    private var activeConversationFaceProfileId: String?
+    private var rollingBuffersByFaceProfileId: [String: RollingFaceConversationBuffer] = [:]
     private var transcriptSegments: [TimestampedTranscriptSegment] = []
     private var conversationState = ConversationState.empty
     private var currentTranscript = ""
@@ -46,6 +78,7 @@ final class MemoryCoordinator: ObservableObject {
     private var transcriptCommitTask: Task<Void, Never>?
     private var reconciliationTask: Task<Void, Never>?
     private var finalAnalysisTask: Task<Void, Never>?
+    private var conversationID: UUID?
 
     init(
         memoryBridge: MemoryBridge,
@@ -62,10 +95,12 @@ final class MemoryCoordinator: ObservableObject {
     func beginFaceBoundConversation() {
         guard !isConversationActive else { return }
 
+        let newConversationID = UUID()
         isConversationActive = true
+        conversationID = newConversationID
+        activeConversationFaceProfileId = canStoreForActiveFace ? faceProfileId : nil
         conversationStartedAt = Date()
         transcriptSegments = []
-        conversationState = .empty
         currentTranscript = ""
         lastCommittedTranscript = ""
         lastSavedEvidenceQuote = ""
@@ -74,6 +109,12 @@ final class MemoryCoordinator: ObservableObject {
         liveAnalysisTask?.cancel()
         transcriptCommitTask?.cancel()
         finalAnalysisTask?.cancel()
+
+        if let activeConversationFaceProfileId {
+            prepareRollingBufferForCurrentConversation(faceProfileId: activeConversationFaceProfileId)
+        } else {
+            conversationState = .empty
+        }
 
         print("MindAnchor conversation: started face-bound transcription")
         startReconciliationLoop()
@@ -92,18 +133,26 @@ final class MemoryCoordinator: ObservableObject {
         reconciliationTask = nil
 
         let fullTranscript = formattedTranscript()
+        let endedConversationID = conversationID
         guard !fullTranscript.isEmpty else {
             print("MindAnchor conversation: ended with no transcript")
+            conversationID = nil
+            activeConversationFaceProfileId = nil
             return
         }
 
-        if shouldUseLLMRefinement, localExtractor.shouldSendToLLM(fullTranscript) {
+        if shouldUseLLMRefinement {
             print("MindAnchor conversation: ended, running final pass")
             finalAnalysisTask = Task { [weak self] in
-                await self?.runFinalAnalysis(fullTranscript: fullTranscript)
+                await self?.runFinalAnalysis(
+                    conversationID: endedConversationID,
+                    fullTranscript: fullTranscript
+                )
             }
         } else {
             print("MindAnchor conversation: ended")
+            conversationID = nil
+            activeConversationFaceProfileId = nil
         }
     }
 
@@ -134,6 +183,7 @@ final class MemoryCoordinator: ObservableObject {
             commitCurrentTranscriptSnapshot()
             currentTranscript = ""
             lastCommittedTranscript = ""
+            activeConversationFaceProfileId = faceProfileId
         }
 
         self.faceProfileId = faceProfileId
@@ -164,14 +214,15 @@ final class MemoryCoordinator: ObservableObject {
             text: cleanedTranscript
         )
         replaceLatestTranscriptSnapshot(with: segment)
+        updateRollingTranscriptBuffer(with: segment)
 
         lastCommittedTranscript = cleanedTranscript
         print("MindAnchor transcript snapshot:", segment.formattedLine)
-        if !storeLocalPersonIfNeeded(from: cleanedTranscript) {
+        if !shouldUseLLMRefinement, !storeLocalPersonIfNeeded(from: cleanedTranscript) {
             storeLocalInteractionIfNeeded(from: cleanedTranscript)
         }
 
-        if shouldUseLLMRefinement, localExtractor.shouldSendToLLM(cleanedTranscript) {
+        if shouldUseLLMRefinement {
             scheduleLiveAnalysis()
         }
     }
@@ -183,10 +234,11 @@ final class MemoryCoordinator: ObservableObject {
         }
 
         liveAnalysisTask = Task { [weak self] in
+            let conversationID = self?.conversationID
             try? await Task.sleep(for: .milliseconds(900))
             guard !Task.isCancelled else { return }
 
-            await self?.runLiveAnalysis()
+            await self?.runLiveAnalysis(conversationID: conversationID)
         }
     }
 
@@ -198,12 +250,13 @@ final class MemoryCoordinator: ObservableObject {
                 guard !Task.isCancelled else { return }
                 guard self?.shouldUseLLMRefinement == true else { continue }
 
-                await self?.runReconciliationPass()
+                let conversationID = self?.conversationID
+                await self?.runReconciliationPass(conversationID: conversationID)
             }
         }
     }
 
-    private func runLiveAnalysis() async {
+    private func runLiveAnalysis(conversationID: UUID?) async {
         defer {
             liveAnalysisTask = nil
             if needsLiveAnalysisRerun, isConversationActive {
@@ -211,56 +264,97 @@ final class MemoryCoordinator: ObservableObject {
                 scheduleLiveAnalysis()
             }
         }
-        guard isConversationActive else { return }
+        guard isConversationActive, conversationID == self.conversationID else { return }
 
         let transcriptWindow = formattedTranscript()
         guard !transcriptWindow.isEmpty else { return }
-        guard localExtractor.shouldSendToLLM(transcriptWindow) else { return }
 
         let result = await decisionEngine.updateConversationState(
             previousState: conversationState,
             recentTranscript: transcriptWindow
         )
+        guard !Task.isCancelled, isConversationActive, conversationID == self.conversationID else { return }
         conversationState = result.conversationState
+        persistConversationStateForActiveFace()
 
-        print("MindAnchor live decision:", result.decision)
+        print("MindAnchor Apple model decision live:", result.decision)
+        printSaveScore(result.decision, phase: "live")
         print("MindAnchor conversation state:", conversationState.promptJSON)
-        _ = storeIfNeeded(decision: result.decision, transcript: transcriptWindow)
+        _ = processPolicyDecision(modelDecision: result.decision, transcript: transcriptWindow, phase: "live")
     }
 
-    private func runReconciliationPass() async {
-        guard isConversationActive else { return }
+    private func runReconciliationPass(conversationID: UUID?) async {
+        guard isConversationActive, conversationID == self.conversationID else { return }
 
         let transcriptWindow = formattedTranscript()
         guard !transcriptWindow.isEmpty else { return }
-        guard localExtractor.shouldSendToLLM(transcriptWindow) else { return }
 
         let result = await decisionEngine.reconcileConversationState(
             previousState: conversationState,
             transcriptWindow: transcriptWindow
         )
+        guard !Task.isCancelled, isConversationActive, conversationID == self.conversationID else { return }
         conversationState = result.conversationState
+        persistConversationStateForActiveFace()
 
-        print("MindAnchor reconciliation decision:", result.decision)
+        print("MindAnchor Apple model decision reconciliation:", result.decision)
+        printSaveScore(result.decision, phase: "reconciliation")
         print("MindAnchor conversation state:", conversationState.promptJSON)
-        _ = storeIfNeeded(decision: result.decision, transcript: transcriptWindow)
+        _ = processPolicyDecision(modelDecision: result.decision, transcript: transcriptWindow, phase: "reconciliation")
     }
 
-    private func runFinalAnalysis(fullTranscript: String) async {
+    private func runFinalAnalysis(conversationID: UUID?, fullTranscript: String) async {
+        guard conversationID == self.conversationID else { return }
         let result = await decisionEngine.finalizeConversation(
             previousState: conversationState,
             fullTranscript: fullTranscript
         )
+        guard !Task.isCancelled, conversationID == self.conversationID else { return }
         conversationState = result.conversationState
+        persistConversationStateForActiveFace()
 
-        print("MindAnchor final decision:", result.decision)
+        print("MindAnchor Apple model decision final:", result.decision)
+        printSaveScore(result.decision, phase: "final")
         print("MindAnchor conversation state:", conversationState.promptJSON)
-        _ = storeIfNeeded(decision: result.decision, transcript: fullTranscript)
+        _ = processPolicyDecision(modelDecision: result.decision, transcript: fullTranscript, phase: "final")
+        self.conversationID = nil
+        self.activeConversationFaceProfileId = nil
+    }
+
+    private func processPolicyDecision(
+        modelDecision: TranscriptAnalysisDecision,
+        transcript: String,
+        phase: String
+    ) -> Bool {
+        print("MindAnchor policy transcript \(phase):", transcript)
+        let policyDecision = capturePolicy.evaluate(
+            modelDecision: modelDecision,
+            transcript: transcript,
+            activeDraft: activeDraftPersonForCurrentFace()
+        )
+        print("MindAnchor policy decision \(phase):", policyDecision)
+        printSaveScore(policyDecision.finalDecision, phase: "policy-\(phase)")
+
+        switch policyDecision.action {
+        case .ignore:
+            print("MindAnchor memory not saved by policy:", policyDecision.reason)
+            return false
+        case .acceptModel:
+            return storeIfNeeded(decision: policyDecision.finalDecision, transcript: transcript)
+        case let .storePersonCandidate(candidate):
+            return storeLocalPersonCandidate(candidate, transcript: transcript)
+        case let .updateActiveDraftWithContext(candidate):
+            return storeLocalContextCandidate(candidate, transcript: transcript)
+        }
     }
 
     private func storeIfNeeded(decision: TranscriptAnalysisDecision, transcript: String) -> Bool {
         guard canStoreForActiveFace else { return false }
-        guard decision.shouldStore, decision.memoryType != .none, decision.storageConfidence >= 0.8 else { return false }
+        let minimumSaveScore = minimumSaveScore(for: decision)
+        guard decision.shouldStore, decision.memoryType != .none, decision.storageConfidence >= minimumSaveScore else {
+            print("MindAnchor memory not saved: saveScore=\(formattedScore(decision.storageConfidence)), shouldStore=\(decision.shouldStore), memoryType=\(decision.memoryType.rawValue)")
+            return false
+        }
 
         if decision.memoryType != .person {
             return storeInteractionIfNeeded(decision: decision, transcript: transcript)
@@ -274,13 +368,16 @@ final class MemoryCoordinator: ObservableObject {
             print("MindAnchor memory rejected: invalid person extraction:", decision)
             return false
         }
+        let extractedRelationship = decision.extractedRelationship
+        let extractedHelpfulContext = decision.extractedHelpfulContext
+            ?? (extractedRelationship == nil ? "No context captured yet" : nil)
 
         let signature = [
             faceProfileId,
             decision.memoryType.rawValue,
             decision.extractedName ?? "",
-            decision.extractedRelationship ?? "",
-            decision.extractedHelpfulContext ?? ""
+            extractedRelationship ?? "",
+            extractedHelpfulContext ?? ""
         ].joined(separator: "|").lowercased()
         guard !signature.isEmpty, signature != lastStoredSignature else { return false }
 
@@ -294,11 +391,11 @@ final class MemoryCoordinator: ObservableObject {
         guard let memory = memoryBridge.storePersonDraft(
             transcript: transcript,
             extractedName: decision.extractedName,
-            extractedRelationship: decision.extractedRelationship,
-            extractedHelpfulContext: decision.extractedHelpfulContext,
+            extractedRelationship: extractedRelationship,
+            extractedHelpfulContext: extractedHelpfulContext,
             faceProfileId: faceProfileId,
             confidence: faceConfidence,
-            needsCaregiverReview: false
+            needsCaregiverReview: true
         ) else {
             latestEvent = nil
             return false
@@ -311,7 +408,7 @@ final class MemoryCoordinator: ObservableObject {
             try? await Task.sleep(for: .milliseconds(350))
             latestEvent = MemoryCoordinatorEvent(
                 kind: .stored,
-                title: "Remembered",
+                title: "Saved",
                 subtitle: memory.name,
                 patientSafeResponse: decision.patientSafeResponse ?? memoryBridge.recognizeApprovedPerson(faceProfileId: faceProfileId)
             )
@@ -319,9 +416,57 @@ final class MemoryCoordinator: ObservableObject {
         return true
     }
 
+    private func printSaveScore(_ decision: TranscriptAnalysisDecision, phase: String) {
+        print(
+            "MindAnchor saveScore \(phase): \(formattedScore(decision.storageConfidence)), shouldStore=\(decision.shouldStore), memoryType=\(decision.memoryType.rawValue)"
+        )
+    }
+
+    private func formattedScore(_ score: Double) -> String {
+        String(format: "%.2f", score)
+    }
+
+    private func mergedDraftField(
+        currentValue: String,
+        incomingValue: String?,
+        emptyValues: Set<String>
+    ) -> String {
+        let current = currentValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let incoming = incomingValue?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedCurrent = current.lowercased()
+        let normalizedEmptyValues = Set(emptyValues.map { $0.lowercased() })
+
+        if let incoming, !incoming.isEmpty, normalizedEmptyValues.contains(normalizedCurrent) {
+            return incoming
+        }
+
+        if current.isEmpty, let incoming, !incoming.isEmpty {
+            return incoming
+        }
+
+        return current.isEmpty ? (incoming ?? "") : current
+    }
+
+    private func minimumSaveScore(for decision: TranscriptAnalysisDecision) -> Double {
+        if decision.memoryType == .person, cleanedDecisionField(decision.extractedName) != nil {
+            return 0.45
+        }
+
+        return 0.8
+    }
+
     private func storeLocalPersonIfNeeded(from transcript: String) -> Bool {
         guard canStoreForActiveFace else { return false }
-        guard let candidate = localExtractor.extractPersonProfile(from: transcript) else { return false }
+        guard let candidate = localExtractor.extractPersonProfile(from: transcript) else {
+            return storeLocalContextForActiveDraftIfNeeded(from: transcript)
+        }
+
+        return storeLocalPersonCandidate(candidate, transcript: transcript)
+    }
+
+    private func storeLocalPersonCandidate(_ candidate: LocalPersonProfileCandidate, transcript: String) -> Bool {
+        guard canStoreForActiveFace else { return false }
+        print("MindAnchor candidate extraction: found name \(candidate.name)")
 
         let signature = [
             faceProfileId,
@@ -339,6 +484,12 @@ final class MemoryCoordinator: ObservableObject {
             patientSafeResponse: nil
         )
 
+        let hadExistingDraft = memoryBridge.allPeople().contains {
+            $0.faceProfileId == faceProfileId &&
+                $0.name.caseInsensitiveCompare(candidate.name) == .orderedSame &&
+                $0.status == .draft
+        }
+
         guard let memory = memoryBridge.storePersonDraft(
             transcript: transcript,
             extractedName: candidate.name,
@@ -346,26 +497,36 @@ final class MemoryCoordinator: ObservableObject {
             extractedHelpfulContext: candidate.helpfulContext,
             faceProfileId: faceProfileId,
             confidence: faceConfidence,
-            needsCaregiverReview: false
+            needsCaregiverReview: true
         ) else {
             latestEvent = nil
             return false
         }
 
-        let interaction = memoryBridge.storeInteractionMemory(
-            memoryType: "lastInteraction",
-            summary: candidate.summary,
-            evidenceQuote: candidate.evidenceQuote,
-            emotionalContext: nil,
-            followUpContext: nil,
-            retentionHint: "recent",
-            transcript: transcript,
-            faceProfileId: faceProfileId
-        )
+        let interaction = candidate.hasDurableContext
+            ? memoryBridge.storeInteractionMemory(
+                memoryType: "lastInteraction",
+                summary: candidate.summary,
+                evidenceQuote: candidate.evidenceQuote,
+                emotionalContext: nil,
+                followUpContext: nil,
+                retentionHint: "recent",
+                transcript: transcript,
+                faceProfileId: faceProfileId
+            )
+            : nil
 
         lastStoredSignature = signature
         lastSavedEvidenceQuote = candidate.evidenceQuote
         lastLocalSaveDate = Date()
+        if hadExistingDraft {
+            print("MindAnchor draft person updated:", memory.name)
+            if candidate.helpfulContext != "Not captured yet" {
+                print("MindAnchor active draft updated with context:", candidate.helpfulContext)
+            }
+        } else {
+            print("MindAnchor draft person created:", memory.name)
+        }
         print("MindAnchor local person memory saved:", memory.name)
         if let interaction {
             print("MindAnchor local interaction memory saved:", interaction.summary)
@@ -375,12 +536,99 @@ final class MemoryCoordinator: ObservableObject {
             try? await Task.sleep(for: .milliseconds(180))
             latestEvent = MemoryCoordinatorEvent(
                 kind: .stored,
-                title: "Remembered",
+                title: "Saved",
                 subtitle: memory.name,
                 patientSafeResponse: memoryBridge.recognizeApprovedPerson(faceProfileId: faceProfileId)
             )
         }
         return true
+    }
+
+    private func storeLocalContextForActiveDraftIfNeeded(from transcript: String) -> Bool {
+        guard let contextCandidate = localExtractor.extractPersonContext(from: transcript) else { return false }
+        return storeLocalContextCandidate(contextCandidate, transcript: transcript)
+    }
+
+    private func storeLocalContextCandidate(_ contextCandidate: LocalPersonContextCandidate, transcript: String) -> Bool {
+        guard canStoreForActiveFace else { return false }
+        guard let activeDraft = activeDraftPersonForCurrentFace() else {
+            return false
+        }
+
+        let mergedRelationship = mergedDraftField(
+            currentValue: activeDraft.relationship,
+            incomingValue: contextCandidate.relationship,
+            emptyValues: ["Unknown", "person I met", "possible acquaintance"]
+        )
+        let mergedHelpfulContext = mergedDraftField(
+            currentValue: activeDraft.helpfulContext,
+            incomingValue: contextCandidate.helpfulContext,
+            emptyValues: ["Not captured yet", "No context captured yet", "No helpful context captured yet."]
+        )
+
+        let signature = [
+            faceProfileId,
+            "person-context",
+            activeDraft.name,
+            mergedRelationship,
+            mergedHelpfulContext,
+            contextCandidate.evidenceQuote
+        ].joined(separator: "|").lowercased()
+        guard !signature.isEmpty, signature != lastStoredSignature else { return false }
+
+        latestEvent = MemoryCoordinatorEvent(
+            kind: .saving,
+            title: "Saving",
+            subtitle: activeDraft.name,
+            patientSafeResponse: nil
+        )
+
+        guard let memory = memoryBridge.storePersonDraft(
+            transcript: transcript,
+            extractedName: activeDraft.name,
+            extractedRelationship: mergedRelationship,
+            extractedHelpfulContext: mergedHelpfulContext,
+            faceProfileId: faceProfileId,
+            confidence: faceConfidence,
+            needsCaregiverReview: true
+        ) else {
+            latestEvent = nil
+            return false
+        }
+
+        lastStoredSignature = signature
+        lastSavedEvidenceQuote = contextCandidate.evidenceQuote
+        lastLocalSaveDate = Date()
+        print("MindAnchor active draft updated with context:", contextCandidate.displayContext)
+        print("MindAnchor local person memory saved:", memory.name)
+
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(180))
+            latestEvent = MemoryCoordinatorEvent(
+                kind: .stored,
+                title: "Saved",
+                subtitle: memory.name,
+                patientSafeResponse: memoryBridge.recognizeApprovedPerson(faceProfileId: faceProfileId)
+            )
+        }
+        return true
+    }
+
+    private func activeDraftPersonForCurrentFace() -> DemoPersonMemory? {
+        memoryBridge.allPeople().first {
+            $0.faceProfileId == faceProfileId &&
+                $0.status == .draft &&
+                !$0.caregiverApproved
+        }
+    }
+
+    private func storeLocalPersonFallbackIfNeeded(from transcript: String, reason: String) {
+        guard shouldUseLLMRefinement else { return }
+        print("MindAnchor fallback check:", reason)
+
+        if storeLocalPersonIfNeeded(from: transcript) {
+            print("MindAnchor fallback person memory saved after LLM miss")
+        }
     }
 
     private func storeLocalInteractionIfNeeded(from transcript: String) {
@@ -426,7 +674,7 @@ final class MemoryCoordinator: ObservableObject {
             try? await Task.sleep(for: .milliseconds(180))
             latestEvent = MemoryCoordinatorEvent(
                 kind: .stored,
-                title: "Remembered",
+                title: "Saved",
                 subtitle: nil,
                 patientSafeResponse: memory.summary
             )
@@ -498,7 +746,7 @@ final class MemoryCoordinator: ObservableObject {
             try? await Task.sleep(for: .milliseconds(350))
             latestEvent = MemoryCoordinatorEvent(
                 kind: .stored,
-                title: "Remembered",
+                title: "Saved",
                 subtitle: nil,
                 patientSafeResponse: decision.patientSafeResponse ?? memory.summary
             )
@@ -506,10 +754,81 @@ final class MemoryCoordinator: ObservableObject {
         return true
     }
 
+    private func prepareRollingBufferForCurrentConversation(faceProfileId: String) {
+        let now = Date()
+        if let existingBuffer = rollingBuffersByFaceProfileId[faceProfileId],
+           now.timeIntervalSince(existingBuffer.lastUpdatedAt) <= conversationMergeGraceWindow {
+            conversationState = existingBuffer.conversationState
+            let combined = existingBuffer.combinedTranscriptForLogging
+            if !combined.isEmpty {
+                print("MindAnchor conversation: resumed rolling buffer for \(faceProfileId)")
+                print("MindAnchor combined transcript for \(faceProfileId): \(combined).")
+            }
+            return
+        }
+
+        rollingBuffersByFaceProfileId[faceProfileId] = RollingFaceConversationBuffer(lastUpdatedAt: now)
+        conversationState = .empty
+    }
+
+    private func updateRollingTranscriptBuffer(with segment: TimestampedTranscriptSegment) {
+        guard let conversationID else { return }
+        guard let faceProfileId = activeConversationFaceProfileId ?? (canStoreForActiveFace ? self.faceProfileId : nil) else { return }
+
+        var buffer = rollingBuffersByFaceProfileId[faceProfileId] ?? RollingFaceConversationBuffer()
+        let now = Date()
+        if now.timeIntervalSince(buffer.lastUpdatedAt) > conversationMergeGraceWindow,
+           !buffer.fragments.contains(where: { $0.conversationID == conversationID }) {
+            buffer = RollingFaceConversationBuffer()
+            buffer.conversationState = .empty
+        }
+
+        let cleanedText = segment.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanedText.isEmpty else { return }
+
+        if let index = buffer.fragments.firstIndex(where: { $0.conversationID == conversationID }) {
+            buffer.fragments[index].text = cleanedText
+            buffer.fragments[index].updatedAt = now
+        } else if !buffer.fragments.contains(where: { $0.text == cleanedText }) {
+            buffer.fragments.append(
+                RollingTranscriptFragment(
+                    conversationID: conversationID,
+                    text: cleanedText,
+                    updatedAt: now
+                )
+            )
+        }
+
+        buffer.lastUpdatedAt = now
+        rollingBuffersByFaceProfileId[faceProfileId] = buffer
+        logCombinedTranscriptIfNeeded(for: faceProfileId, buffer: buffer)
+    }
+
+    private func persistConversationStateForActiveFace() {
+        guard let faceProfileId = activeConversationFaceProfileId ?? (canStoreForActiveFace ? self.faceProfileId : nil) else { return }
+        guard var buffer = rollingBuffersByFaceProfileId[faceProfileId] else { return }
+        buffer.conversationState = conversationState
+        buffer.lastUpdatedAt = Date()
+        rollingBuffersByFaceProfileId[faceProfileId] = buffer
+    }
+
+    private func logCombinedTranscriptIfNeeded(for faceProfileId: String, buffer: RollingFaceConversationBuffer) {
+        let combined = buffer.combinedTranscriptForLogging
+        guard !combined.isEmpty else { return }
+        if buffer.fragments.count > 1 {
+            print("MindAnchor combined transcript for \(faceProfileId): \(combined).")
+        }
+    }
+
     private func formattedTranscript() -> String {
-        transcriptSegments
+        if let faceProfileId = activeConversationFaceProfileId ?? (canStoreForActiveFace ? self.faceProfileId : nil),
+           let buffer = rollingBuffersByFaceProfileId[faceProfileId] {
+            return buffer.combinedTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        return transcriptSegments
             .last?
-            .formattedLine
+            .text
             .trimmingCharacters(in: .whitespacesAndNewlines)
         ?? ""
     }
@@ -530,7 +849,6 @@ final class MemoryCoordinator: ObservableObject {
         guard let name = cleanedDecisionField(decision.extractedName) else { return false }
         let relationship = cleanedDecisionField(decision.extractedRelationship)
         let helpfulContext = cleanedDecisionField(decision.extractedHelpfulContext)
-        guard relationship != nil || helpfulContext != nil else { return false }
 
         let normalizedName = normalized(name)
         guard !isGenericNamePlaceholder(normalizedName) else { return false }
@@ -592,7 +910,13 @@ final class MemoryCoordinator: ObservableObject {
             "someone",
             "somebody",
             "unknown",
-            "friend"
+            "friend",
+            "patient",
+            "memory",
+            "interactionsummary",
+            "event",
+            "prototype",
+            "response"
         ].contains(value)
     }
 
@@ -609,7 +933,13 @@ final class MemoryCoordinator: ObservableObject {
             "transcript",
             "someone",
             "somebody",
-            "unknown"
+            "unknown",
+            "patient",
+            "memory",
+            "interactionsummary",
+            "event",
+            "prototype",
+            "response"
         ].contains(value)
     }
 }
@@ -629,26 +959,163 @@ private struct LocalPersonProfileCandidate {
     var helpfulContext: String
     var summary: String
     var evidenceQuote: String
+
+    var hasDurableContext: Bool {
+        relationship != "Unknown" || helpfulContext != "Not captured yet"
+    }
+}
+
+private struct LocalPersonContextCandidate {
+    var relationship: String?
+    var helpfulContext: String?
+    var evidenceQuote: String
+
+    var displayContext: String {
+        helpfulContext ?? relationship ?? "context"
+    }
+}
+
+private struct MemoryCapturePolicyDecision: CustomStringConvertible {
+    enum Action {
+        case ignore
+        case acceptModel
+        case storePersonCandidate(LocalPersonProfileCandidate)
+        case updateActiveDraftWithContext(LocalPersonContextCandidate)
+    }
+
+    var action: Action
+    var finalDecision: TranscriptAnalysisDecision
+    var reason: String
+
+    var description: String {
+        let actionName: String
+        switch action {
+        case .ignore:
+            actionName = "ignore"
+        case .acceptModel:
+            actionName = "acceptModel"
+        case let .storePersonCandidate(candidate):
+            actionName = "storePersonCandidate(\(candidate.name))"
+        case let .updateActiveDraftWithContext(candidate):
+            actionName = "updateActiveDraftWithContext(\(candidate.displayContext))"
+        }
+
+        return "action=\(actionName), reason=\(reason), finalDecision=[\(finalDecision)]"
+    }
+}
+
+private struct MemoryCapturePolicy {
+    private let extractor = LocalEpisodicMemoryExtractor()
+
+    func evaluate(
+        modelDecision: TranscriptAnalysisDecision,
+        transcript: String,
+        activeDraft: DemoPersonMemory?
+    ) -> MemoryCapturePolicyDecision {
+        if let personCandidate = extractor.extractPersonProfile(from: transcript) {
+            return MemoryCapturePolicyDecision(
+                action: .storePersonCandidate(personCandidate),
+                finalDecision: decision(for: personCandidate),
+                reason: personCandidate.hasDurableContext
+                    ? "policy found identity with useful context"
+                    : "policy found self-introduction candidate"
+            )
+        }
+
+        if activeDraft != nil, let contextCandidate = extractor.extractPersonContext(from: transcript) {
+            return MemoryCapturePolicyDecision(
+                action: .updateActiveDraftWithContext(contextCandidate),
+                finalDecision: decision(for: contextCandidate, activeDraft: activeDraft),
+                reason: "policy found context for active draft"
+            )
+        }
+
+        if shouldAcceptModel(modelDecision) {
+            return MemoryCapturePolicyDecision(
+                action: .acceptModel,
+                finalDecision: modelDecision,
+                reason: "model decision passed policy"
+            )
+        }
+
+        return MemoryCapturePolicyDecision(
+            action: .ignore,
+            finalDecision: modelDecision,
+            reason: "no durable memory evidence"
+        )
+    }
+
+    private func shouldAcceptModel(_ decision: TranscriptAnalysisDecision) -> Bool {
+        guard decision.shouldStore, decision.memoryType != .none else { return false }
+
+        if decision.memoryType == .person {
+            return decision.extractedName != nil && decision.storageConfidence >= 0.45
+        }
+
+        return decision.storageConfidence >= 0.8 &&
+            decision.interactionSummary != nil &&
+            decision.evidenceQuote != nil
+    }
+
+    private func decision(for candidate: LocalPersonProfileCandidate) -> TranscriptAnalysisDecision {
+        TranscriptAnalysisDecision(
+            shouldStore: true,
+            memoryType: .person,
+            importance: candidate.hasDurableContext ? .medium : .low,
+            storageConfidence: candidate.hasDurableContext ? 0.78 : 0.58,
+            extractedName: candidate.name,
+            extractedRelationship: candidate.relationship == "Unknown" ? nil : candidate.relationship,
+            extractedHelpfulContext: candidate.helpfulContext == "Not captured yet" ? nil : candidate.helpfulContext,
+            interactionSummary: nil,
+            evidenceQuote: candidate.evidenceQuote,
+            emotionalContext: nil,
+            followUpContext: nil,
+            retentionHint: candidate.hasDurableContext ? "recent" : "Incomplete identity. Caregiver should add relationship/context.",
+            needsCaregiverReview: true,
+            patientSafeResponse: nil
+        )
+    }
+
+    private func decision(
+        for candidate: LocalPersonContextCandidate,
+        activeDraft: DemoPersonMemory?
+    ) -> TranscriptAnalysisDecision {
+        TranscriptAnalysisDecision(
+            shouldStore: true,
+            memoryType: .person,
+            importance: .medium,
+            storageConfidence: 0.72,
+            extractedName: activeDraft?.name,
+            extractedRelationship: candidate.relationship,
+            extractedHelpfulContext: candidate.helpfulContext,
+            interactionSummary: nil,
+            evidenceQuote: candidate.evidenceQuote,
+            emotionalContext: nil,
+            followUpContext: nil,
+            retentionHint: "recent",
+            needsCaregiverReview: true,
+            patientSafeResponse: nil
+        )
+    }
 }
 
 private struct LocalEpisodicMemoryExtractor {
     func extractPersonProfile(from transcript: String) -> LocalPersonProfileCandidate? {
         let cleaned = cleanedTranscript(from: transcript)
         let wordCount = cleaned.split(whereSeparator: \.isWhitespace).count
-        guard wordCount >= 3 else { return nil }
+        guard wordCount >= 2 else { return nil }
         guard !containsBlockedLanguage(cleaned) else { return nil }
         guard !isMostlyNoise(cleaned) else { return nil }
-        guard isCompleteEnough(cleaned) else { return nil }
-        guard !endsWithIncompleteThought(cleaned) else { return nil }
 
         guard let name = extractName(from: cleaned) else { return nil }
+        guard isCompleteEnough(cleaned) || isNameOnlyIntroduction(cleaned, name: name) else { return nil }
+        guard !endsWithIncompleteThought(cleaned) else { return nil }
         let remaining = textAfterName(name, in: cleaned)
         let relationship = extractRelationship(from: cleaned, name: name)
         let helpfulContext = extractHelpfulContext(from: remaining)
-        guard relationship != nil || helpfulContext != nil else { return nil }
 
-        let normalizedRelationship = relationship ?? "person I met"
-        let normalizedHelpfulContext = helpfulContext ?? "was introduced during the conversation"
+        let normalizedRelationship = relationship ?? "Unknown"
+        let normalizedHelpfulContext = helpfulContext ?? "Not captured yet"
         let summary = "\(name) was introduced. \(sentenceCased(normalizedHelpfulContext))."
 
         return LocalPersonProfileCandidate(
@@ -656,6 +1123,27 @@ private struct LocalEpisodicMemoryExtractor {
             relationship: normalizedRelationship,
             helpfulContext: normalizedHelpfulContext,
             summary: summary,
+            evidenceQuote: cleaned
+        )
+    }
+
+    func extractPersonContext(from transcript: String) -> LocalPersonContextCandidate? {
+        let cleaned = cleanedTranscript(from: transcript)
+        let wordCount = cleaned.split(whereSeparator: \.isWhitespace).count
+        guard wordCount >= 3 else { return nil }
+        guard !containsBlockedLanguage(cleaned) else { return nil }
+        guard !isMostlyNoise(cleaned) else { return nil }
+
+        let lowercased = cleaned.lowercased()
+        guard !isLowValueChatter(lowercased) else { return nil }
+
+        let relationship = extractStandaloneRelationship(from: cleaned)
+        let helpfulContext = extractHelpfulContext(from: cleaned)
+        guard relationship != nil || helpfulContext != nil else { return nil }
+
+        return LocalPersonContextCandidate(
+            relationship: relationship,
+            helpfulContext: helpfulContext,
             evidenceQuote: cleaned
         )
     }
@@ -729,7 +1217,7 @@ private struct LocalEpisodicMemoryExtractor {
 
     private func cleanedTranscript(from transcript: String) -> String {
         let withoutTimecode = transcript.replacingOccurrences(
-            of: #"^\[\d{2}:\d{2}\]\s*Speaker\s+[A-Z]:\s*"#,
+            of: #"^\[\d{2}:\d{2}\]\s*(?:Speaker\s+[A-Z]|Conversation):\s*"#,
             with: "",
             options: .regularExpression
         )
@@ -757,7 +1245,7 @@ private struct LocalEpisodicMemoryExtractor {
 
             let name = String(text[matchRange]).trimmingCharacters(in: .whitespacesAndNewlines)
             if isPlausibleName(name) {
-                return name
+                return displayName(from: name)
             }
         }
 
@@ -799,11 +1287,52 @@ private struct LocalEpisodicMemoryExtractor {
         return nil
     }
 
+    private func extractStandaloneRelationship(from text: String) -> String? {
+        let lowercased = text.lowercased()
+
+        if lowercased.contains("neighbor from next door") || lowercased.contains("neighbour from next door") {
+            return "neighbor from next door"
+        }
+
+        if lowercased.contains("your neighbor") || lowercased.contains("your neighbour") {
+            return "neighbor"
+        }
+
+        if lowercased.contains("same school") || lowercased.contains("go to school") {
+            return nil
+        }
+
+        for term in relationshipTerms where lowercased.contains(term) {
+            if term == "mom" { return "mother" }
+            if term == "dad" { return "father" }
+            return term
+        }
+
+        return nil
+    }
+
     private func extractHelpfulContext(from text: String) -> String? {
+        let lowercased = text.lowercased()
         let pronounPrefixes = [
             "he is ", "he's ", "she is ", "she's ", "they are ", "they're ",
             "he knows ", "she knows ", "they know ", "knows ", "who "
         ]
+
+        if lowercased.contains("we go to the same school") || lowercased.contains("we go to same school") {
+            return "goes to the same school"
+        }
+
+        if lowercased.contains("i go to school") || lowercased.contains("i go to the school") {
+            return "goes to school"
+        }
+
+        if lowercased.contains("i live next door") || lowercased.contains("live next door") {
+            return "lives next door"
+        }
+
+        if lowercased.contains("i help bring in your mail") || lowercased.contains("help bring in your mail") {
+            return "helps bring in your mail"
+        }
 
         if let range = text.range(of: "knows how to ", options: [.caseInsensitive]) {
             let activity = String(text[range.upperBound...])
@@ -864,6 +1393,22 @@ private struct LocalEpisodicMemoryExtractor {
         return completionHints.contains { lowercased.contains($0) }
     }
 
+    private func isNameOnlyIntroduction(_ text: String, name: String) -> Bool {
+        let lowercased = text
+            .lowercased()
+            .trimmingCharacters(in: .whitespacesAndNewlines.union(.punctuationCharacters))
+        let escapedName = NSRegularExpression.escapedPattern(for: name.lowercased())
+        let patterns = [
+            #"^(?:hello,\s*)?(?:i\s+am|i'm)\s+\#(escapedName)$"#,
+            #"^(?:hello,\s*)?my\s+name\s+is\s+\#(escapedName)$"#,
+            #"^(?:hello,\s*)?this\s+is\s+\#(escapedName)$"#
+        ]
+
+        return patterns.contains { pattern in
+            lowercased.range(of: pattern, options: .regularExpression) != nil
+        }
+    }
+
     private func endsWithIncompleteThought(_ text: String) -> Bool {
         let trimmed = text
             .lowercased()
@@ -908,9 +1453,14 @@ private struct LocalEpisodicMemoryExtractor {
 
     private func isPlausibleName(_ value: String) -> Bool {
         let normalized = value.lowercased()
-        guard value.first?.isUppercase == true else { return false }
         guard !nameStopWords.contains(normalized) else { return false }
         return value.count >= 2
+    }
+
+    private func displayName(from value: String) -> String {
+        let cleaned = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let first = cleaned.first else { return cleaned }
+        return first.uppercased() + cleaned.dropFirst()
     }
 
     private func extractAbilityContext(from text: String) -> String? {
@@ -986,7 +1536,8 @@ private struct LocalEpisodicMemoryExtractor {
         "smart", "kind", "helpful", "funny", "nice", "important", "from home",
         "from work", "from church", "from school", "knows how to", "code",
         "coding", "developer", "engineer", "program", "programming", "can ",
-        "cannot ", "can't "
+        "cannot ", "can't ", "same school", "go to school", "live next door",
+        "bring in your mail"
     ]
 
     private let blockedTerms = [
@@ -1001,7 +1552,8 @@ private struct LocalEpisodicMemoryExtractor {
         "back home", "from home", "from work", "from church", "from school",
         "passed away", "got back", "funeral", "hospital", "appointment",
         "dinner", "store", "pharmacy", "tomorrow", "tonight", "knows how to code",
-        "knows how to program"
+        "knows how to program", "same school", "go to school", "live next door",
+        "bring in your mail"
     ]
 
     private let lowValueExactPhrases = [

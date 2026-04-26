@@ -27,46 +27,51 @@ struct PatientCameraView: View {
     var body: some View {
         let profileDisplay = viewModel.detectionResult.faceProfileId.map {
             memoryBridge.profileDisplay(for: $0)
-        } ?? .unknown("I see someone nearby, but I do not know who they are yet.")
+        } ?? .unknown("Unknown face")
 
-        ZStack {
-            Color.black
-                .ignoresSafeArea(.all)
-
-            CameraPreviewView(previewLayer: viewModel.cameraManager.previewLayer)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .ignoresSafeArea(.all)
-
-            if viewModel.detectionResult.hasFace {
-                FaceBoundingBoxOverlay(
-                    detection: viewModel.detectionResult,
-                    title: profileDisplay.title,
-                    description: profileDisplay.description,
-                    detailLines: profileDisplay.detailLines
-                )
-                    .animation(.smooth(duration: 0.16), value: viewModel.detectionResult.boundingBox)
+        GeometryReader { geometry in
+            ZStack {
+                Color.black
                     .ignoresSafeArea(.all)
-                    .allowsHitTesting(false)
-            }
 
-            if let cameraMessage = viewModel.cameraMessage {
-                CameraMessageView(message: cameraMessage)
-                    .padding(.horizontal, 22)
-            }
+                CameraPreviewView(previewLayer: viewModel.cameraManager.previewLayer)
+                    .frame(width: geometry.size.width, height: geometry.size.height)
+                    .ignoresSafeArea(.all)
 
-            VStack(alignment: .trailing, spacing: 10) {
-                if let saveBanner {
-                    SaveBannerView(banner: saveBanner)
-                        .transition(.move(edge: .top).combined(with: .opacity))
+                if viewModel.detectionResult.hasFace {
+                    FaceBoundingBoxOverlay(
+                        detection: viewModel.detectionResult,
+                        title: profileDisplay.title,
+                        description: profileDisplay.description,
+                        detailLines: profileDisplay.detailLines
+                    )
+                        .frame(width: geometry.size.width, height: geometry.size.height)
+                        .animation(.smooth(duration: 0.16), value: viewModel.detectionResult.boundingBox)
+                        .ignoresSafeArea(.all)
+                        .allowsHitTesting(false)
                 }
 
-                Spacer()
+                if let cameraMessage = viewModel.cameraMessage {
+                    CameraMessageView(message: cameraMessage)
+                        .padding(.horizontal, 22)
+                }
+
+                VStack(alignment: .trailing, spacing: 10) {
+                    if let saveBanner {
+                        SaveBannerView(banner: saveBanner)
+                            .transition(.move(edge: .top).combined(with: .opacity))
+                    }
+
+                    Spacer()
+                }
+                .frame(width: geometry.size.width, height: geometry.size.height, alignment: .topTrailing)
+                .padding(.top, 16)
+                .padding(.trailing, 14)
+                .allowsHitTesting(false)
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
-            .padding(.top, 16)
-            .padding(.trailing, 14)
-            .allowsHitTesting(false)
+            .frame(width: geometry.size.width, height: geometry.size.height)
         }
+        .ignoresSafeArea(.all)
         .statusBarHidden(true)
         .persistentSystemOverlays(.hidden)
         .preferredColorScheme(.dark)
