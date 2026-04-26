@@ -14,10 +14,10 @@ import SwiftUI
 final class PatientCameraViewModel: ObservableObject {
     private enum Constants {
         static let minimumFrameInterval: TimeInterval = 0.05
-        static let emptyDetectionTolerance = 8
-        static let expandDetectionsThreshold = 4
-        static let shrinkDetectionsThreshold = 6
-        static let detectionMatchDistance: CGFloat = 0.18
+        static let emptyDetectionTolerance = 4
+        static let expandDetectionsThreshold = 2
+        static let shrinkDetectionsThreshold = 3
+        static let detectionMatchDistance: CGFloat = 0.24
     }
 
     @Published private(set) var detectionResult: FaceDetectionResult = .none
@@ -109,11 +109,12 @@ final class PatientCameraViewModel: ObservableObject {
     private func handleDetectionResults(_ results: [FaceDetectionResult]) {
         let validResults = results.filter(\.hasFace)
         let activeDetections = resolvedStableDetections(from: validResults)
+        let focusCandidates = validResults.isEmpty ? activeDetections : validResults
 
-        if !activeDetections.isEmpty, let focus = resolvedFocusedDetection(from: activeDetections) {
+        if !activeDetections.isEmpty, let focus = resolvedFocusedDetection(from: focusCandidates) {
             faceMissStreak = 0
             focusedBoundingBox = focus.detection.boundingBox
-            focusedFaceIndex = focus.index
+            focusedFaceIndex = resolvedStableFocusIndex(for: focus.detection, within: activeDetections)
 
             let smoothedResult = FaceDetectionResult.detected(
                 confidence: focus.detection.confidence,
@@ -122,7 +123,7 @@ final class PatientCameraViewModel: ObservableObject {
             )
 
             withAnimation(.smooth(duration: 0.16)) {
-                applyDetection(smoothedResult, personIndex: focus.index, totalPeople: activeDetections.count)
+                applyDetection(smoothedResult, personIndex: focusedFaceIndex, totalPeople: activeDetections.count)
             }
             return
         }
@@ -240,6 +241,15 @@ final class PatientCameraViewModel: ObservableObject {
         return (safeIndex, detections[safeIndex])
     }
 
+    private func resolvedStableFocusIndex(for detection: FaceDetectionResult, within detections: [FaceDetectionResult]) -> Int {
+        guard !detections.isEmpty else { return 0 }
+
+        return detections.indices.min(by: { lhs, rhs in
+            detections[lhs].boundingBox.center.distance(to: detection.boundingBox.center)
+                < detections[rhs].boundingBox.center.distance(to: detection.boundingBox.center)
+        }) ?? 0
+    }
+
     private func shouldKeepCurrentStableDetections(with detections: [FaceDetectionResult]) -> Bool {
         if detections.count == stableDetections.count {
             return true
@@ -278,11 +288,12 @@ final class PatientCameraViewModel: ObservableObject {
             if distance <= Constants.detectionMatchDistance {
                 merged.append(bestMatch)
                 remainingIncoming.remove(at: bestMatchIndex)
-            } else {
+            } else if incoming.count >= current.count {
                 merged.append(stable)
             }
         }
 
+        merged.append(contentsOf: remainingIncoming)
         return merged
     }
 
