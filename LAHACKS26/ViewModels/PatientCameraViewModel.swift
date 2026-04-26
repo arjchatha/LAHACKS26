@@ -27,6 +27,7 @@ final class PatientCameraViewModel: ObservableObject {
         static let minimumEmbeddingCaptureInterval: TimeInterval = 0.35
         static let requiredLiveFaceSamples = 20
         static let enrollmentTimeout: TimeInterval = 90
+        static let enrollmentNoFaceFrameLimit = 8
     }
 
     private struct FaceRecognitionState {
@@ -80,6 +81,7 @@ final class PatientCameraViewModel: ObservableObject {
     private var smoothedBoundingBox: CGRect?
     private var recognitionStatesBySlot: [Int: FaceRecognitionState] = [:]
     private var enrollmentSession: LiveEnrollmentSession?
+    private var enrollmentNoFaceStreak = 0
     private var latestPixelBuffer: CVPixelBuffer?
     private var latestDetection: FaceDetectionResult?
     private let unknownPersonDescription = "Unknown"
@@ -125,6 +127,7 @@ final class PatientCameraViewModel: ObservableObject {
 
     func stop() {
         stopSpeechRecording()
+        cancelEnrollmentSession(message: nil)
         cameraManager.stop()
     }
 
@@ -156,9 +159,11 @@ final class PatientCameraViewModel: ObservableObject {
         let validResults = results.filter(\.hasFace)
         guard !validResults.isEmpty else {
             clearDetectionAfterMisses()
+            recordEnrollmentNoFaceFrame()
             return
         }
 
+        enrollmentNoFaceStreak = 0
         let activeDetections = resolvedStableDetections(from: validResults)
 
         if !activeDetections.isEmpty, let focus = resolvedFocusedDetection(from: validResults) {
@@ -291,10 +296,7 @@ final class PatientCameraViewModel: ObservableObject {
 
         let now = Date()
         if now.timeIntervalSince(session.startedAt) > Constants.enrollmentTimeout {
-            enrollmentSession = nil
-            activeEnrollmentName = nil
-            activeEnrollmentProgress = 0
-            liveStatusText = "Ready for a new introduction"
+            cancelEnrollmentSession(message: "Stopped learning \(session.name): timed out.")
             return
         }
 
@@ -327,6 +329,7 @@ final class PatientCameraViewModel: ObservableObject {
                 embeddings: session.embeddings
             )
             enrollmentSession = nil
+            enrollmentNoFaceStreak = 0
             activeEnrollmentName = nil
             activeEnrollmentProgress = 0
             var state = recognitionState(forSlot: focusedFaceIndex, detection: detectionResult)
@@ -374,6 +377,7 @@ final class PatientCameraViewModel: ObservableObject {
         if let name = introducedName(in: cleanedTranscript) {
             if enrollmentSession?.name.localizedCaseInsensitiveCompare(name) != .orderedSame {
                 enrollmentSession = LiveEnrollmentSession(name: name, transcript: cleanedTranscript)
+                enrollmentNoFaceStreak = 0
                 activeEnrollmentName = name
                 activeEnrollmentProgress = 0
                 recognitionStatesBySlot[focusedFaceIndex]?.stableFaceProfileId = nil
@@ -390,6 +394,29 @@ final class PatientCameraViewModel: ObservableObject {
             enrollmentSession = session
         } else if let stableFaceProfileId = recognitionStatesBySlot[focusedFaceIndex]?.stableFaceProfileId, !cleanedTranscript.isEmpty {
             memoryBridge.appendTranscript(cleanedTranscript, to: stableFaceProfileId)
+        }
+    }
+
+    private func recordEnrollmentNoFaceFrame() {
+        guard let session = enrollmentSession else {
+            enrollmentNoFaceStreak = 0
+            return
+        }
+
+        enrollmentNoFaceStreak += 1
+        guard enrollmentNoFaceStreak >= Constants.enrollmentNoFaceFrameLimit else { return }
+
+        cancelEnrollmentSession(message: "Stopped learning \(session.name): no face was visible.")
+    }
+
+    private func cancelEnrollmentSession(message: String?) {
+        enrollmentSession = nil
+        enrollmentNoFaceStreak = 0
+        activeEnrollmentName = nil
+        activeEnrollmentProgress = 0
+
+        if let message {
+            liveStatusText = message
         }
     }
 
