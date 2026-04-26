@@ -42,6 +42,8 @@ DEFAULT_MODEL_SIZE = "medium"
 DEFAULT_DB_PATH = REPO_ROOT / "face_db.json"
 DEFAULT_THRESHOLD = 0.45
 DEFAULT_IMAGE_ROOT = REPO_ROOT / "input_images"
+DEFAULT_EXPORT_DIR = REPO_ROOT / "melange_export"
+DEFAULT_DETECTION_SIZE = 640
 
 
 @dataclass
@@ -182,6 +184,138 @@ def load_face_analysis(model_pack: str = DEFAULT_MODEL_PACK):
     return app
 
 
+def rewrite_onnx_input_shape(
+    source_model: Path,
+    output_model: Path,
+    fixed_input_shape: list[int],
+) -> Path:
+    import onnx
+
+    model = onnx.load(str(source_model))
+    tensor_type = model.graph.input[0].type.tensor_type
+    dims = tensor_type.shape.dim
+    if len(dims) != len(fixed_input_shape):
+        raise ValueError(
+            f"Expected {len(fixed_input_shape)} input dims in {source_model}, found {len(dims)}."
+        )
+
+    for dim, target in zip(dims, fixed_input_shape):
+        dim.ClearField("dim_param")
+        dim.dim_value = int(target)
+
+    onnx.checker.check_model(model)
+    onnx.save(model, str(output_model))
+    return output_model
+
+
+def select_embedding_model_path(model_dir: Path) -> Path:
+    import onnxruntime as ort
+
+    candidates = []
+    for model_path in sorted(model_dir.glob("*.onnx")):
+        try:
+            session = ort.InferenceSession(
+                str(model_path),
+                providers=["CPUExecutionProvider"],
+            )
+        except Exception:
+            continue
+
+        inputs = session.get_inputs()
+        outputs = session.get_outputs()
+        if len(inputs) != 1 or not outputs:
+            continue
+
+        shape = list(inputs[0].shape)
+        if len(shape) != 4:
+            continue
+
+        dims = [dim if isinstance(dim, int) else None for dim in shape]
+        if dims[1] == 3 and dims[2] in {112, 128} and dims[3] in {112, 128}:
+            candidates.append(model_path)
+            continue
+        if dims[3] == 3 and dims[1] in {112, 128} and dims[2] in {112, 128}:
+            candidates.append(model_path)
+
+    if not candidates:
+        raise RuntimeError(
+            f"Could not identify a face embedding ONNX file in {model_dir}. "
+            "Expected a model with a single 4D image input such as 1x3x112x112."
+        )
+
+    preferred = sorted(
+        candidates,
+        key=lambda path: (
+            0 if "w600k" in path.name.lower() else 1,
+            0 if "mbf" in path.name.lower() or "r50" in path.name.lower() else 1,
+            path.name,
+        ),
+    )
+    return preferred[0]
+
+
+def select_detection_model_path(model_dir: Path) -> Path:
+    import onnxruntime as ort
+
+    candidates = []
+    for model_path in sorted(model_dir.glob("*.onnx")):
+        try:
+            session = ort.InferenceSession(
+                str(model_path),
+                providers=["CPUExecutionProvider"],
+            )
+        except Exception:
+            continue
+
+        inputs = session.get_inputs()
+        outputs = session.get_outputs()
+        if len(inputs) != 1 or len(outputs) < 3:
+            continue
+
+        shape = list(inputs[0].shape)
+        if len(shape) != 4:
+            continue
+
+        dims = [dim if isinstance(dim, int) else None for dim in shape]
+        if dims[0] == 1 and dims[1] == 3:
+            candidates.append(model_path)
+
+    if not candidates:
+        raise RuntimeError(f"Could not identify a face detection ONNX file in {model_dir}.")
+
+    preferred = sorted(
+        candidates,
+        key=lambda path: (
+            0 if "det" in path.name.lower() else 1,
+            0 if "500m" in path.name.lower() else 1,
+            path.name,
+        ),
+    )
+    return preferred[0]
+
+
+def inspect_onnx_model(model_path: Path) -> dict[str, object]:
+    import onnxruntime as ort
+
+    session = ort.InferenceSession(
+        str(model_path),
+        providers=["CPUExecutionProvider"],
+    )
+    inputs = session.get_inputs()
+    outputs = session.get_outputs()
+    if len(inputs) != 1:
+        raise RuntimeError(
+            f"Expected exactly one model input in {model_path}, found {len(inputs)}."
+        )
+
+    return {
+        "input_name": inputs[0].name,
+        "input_shape": list(inputs[0].shape),
+        "output_names": [output.name for output in outputs],
+        "output_shapes": [list(output.shape) for output in outputs],
+    }
+
+
 def load_image(image_path: Path) -> np.ndarray:
     np = np_module()
     import cv2
@@ -193,8 +327,7 @@ def load_image(image_path: Path) -> np.ndarray:
     return image
 
 
-def extract_face_embedding(app, image_path: Path) -> FaceEmbedding:
-    np = np_module()
+def detect_best_face(app, image_path: Path) -> tuple[np.ndarray, object]:
     image = load_image(image_path)
     faces = app.get(image)
     if not faces:
@@ -204,6 +337,12 @@ def extract_face_embedding(app, image_path: Path) -> FaceEmbedding:
         faces,
         key=lambda face: float(face.det_score) * bbox_area(face.bbox),
     )
+    return image, best_face
+
+
+def extract_face_embedding(app, image_path: Path) -> FaceEmbedding:
+    np = np_module()
+    _, best_face = detect_best_face(app, image_path)
     embedding = np.asarray(best_face.embedding, dtype=np.float32)
     embedding /= np.linalg.norm(embedding)
     bbox = [float(v) for v in best_face.bbox.tolist()]
@@ -217,6 +356,94 @@ def extract_face_embedding(app, image_path: Path) -> FaceEmbedding:
 def bbox_area(bbox: Iterable[float]) -> float:
     x1, y1, x2, y2 = bbox
     return max(0.0, float(x2) - float(x1)) * max(0.0, float(y2) - float(y1))
+
+
+def clamp_bbox(bbox: Iterable[float], width: int, height: int) -> tuple[int, int, int, int]:
+    x1, y1, x2, y2 = bbox
+    return (
+        max(0, min(int(round(float(x1))), width - 1)),
+        max(0, min(int(round(float(y1))), height - 1)),
+        max(1, min(int(round(float(x2))), width)),
+        max(1, min(int(round(float(y2))), height)),
+    )
+
+
+def extract_face_crop(app, image_path: Path, image_size: int) -> np.ndarray:
+    import cv2
+
+    image, best_face = detect_best_face(app, image_path)
+    kps = getattr(best_face, "kps", None)
+    if kps is not None:
+        from insightface.utils import face_align
+
+        return face_align.norm_crop(image, landmark=kps, image_size=image_size)
+
+    height, width = image.shape[:2]
+    x1, y1, x2, y2 = clamp_bbox(best_face.bbox, width, height)
+    cropped = image[y1:y2, x1:x2]
+    if cropped.size == 0:
+        raise ValueError(f"Detected face crop was empty for {image_path}")
+    return cv2.resize(cropped, (image_size, image_size), interpolation=cv2.INTER_AREA)
+
+
+def resolve_input_hw(input_shape: list[object]) -> tuple[int, int, bool]:
+    if len(input_shape) != 4:
+        raise ValueError(f"Unsupported input shape: {input_shape}")
+
+    dims = [dim if isinstance(dim, int) else None for dim in input_shape]
+    if dims[1] == 3 and dims[2] and dims[3]:
+        return int(dims[2]), int(dims[3]), True
+    if dims[3] == 3 and dims[1] and dims[2]:
+        return int(dims[1]), int(dims[2]), False
+    raise ValueError(f"Unsupported image input layout: {input_shape}")
+
+
+def preprocess_face_for_embedding(face_bgr: np.ndarray, input_shape: list[object]) -> np.ndarray:
+    np = np_module()
+    import cv2
+
+    height, width, channels_first = resolve_input_hw(input_shape)
+    resized = cv2.resize(face_bgr, (width, height), interpolation=cv2.INTER_AREA)
+    rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+    normalized = (rgb.astype(np.float32) - 127.5) / 127.5
+    if channels_first:
+        normalized = np.transpose(normalized, (2, 0, 1))
+    return np.expand_dims(normalized, axis=0)
+
+
+def preprocess_image_for_detection(image_bgr: np.ndarray, image_size: int) -> np.ndarray:
+    np = np_module()
+    import cv2
+
+    resized = cv2.resize(image_bgr, (image_size, image_size), interpolation=cv2.INTER_LINEAR)
+    normalized = (resized.astype(np.float32) - 127.5) / 128.0
+    normalized = np.transpose(normalized, (2, 0, 1))
+    return np.expand_dims(normalized, axis=0)
+
+
+def find_default_sample_image(image_root: Path) -> Path:
+    candidates = sorted(
+        path
+        for path in image_root.rglob("*")
+        if path.is_file() and path.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp"}
+    )
+    if not candidates:
+        raise ValueError(
+            f"No sample images found under {image_root}. "
+            "Pass --image explicitly or add files under input_images/<person>/."
+        )
+    return candidates[0]
+
+
+def write_image(image_path: Path, image: np.ndarray) -> None:
+    import cv2
+
+    suffix = image_path.suffix.lower() or ".png"
+    extension = ".jpg" if suffix in {".jpg", ".jpeg"} else ".png"
+    ok, encoded = cv2.imencode(extension, image)
+    if not ok:
+        raise ValueError(f"Could not encode image for {image_path}")
+    image_path.write_bytes(encoded.tobytes())
 
 
 def cosine_similarity(lhs: np.ndarray, rhs: np.ndarray) -> float:
@@ -274,6 +501,7 @@ def command_prepare(args: argparse.Namespace) -> int:
     model_dir = ensure_model_downloaded(model_pack)
     app = load_face_analysis(model_pack)
     onnx_files = sorted(model_dir.glob("*.onnx"))
+    embedding_model = select_embedding_model_path(model_dir)
     print("Model is ready.")
     print(f"Model size: {args.model_size}")
     print(f"Model pack: {model_pack}")
@@ -282,11 +510,125 @@ def command_prepare(args: argparse.Namespace) -> int:
     print("ONNX files:")
     for path in onnx_files:
         print(f"  {path}")
-    print(
-        "For Melange, upload the face embedding ONNX from this package to the "
-        "Melange dashboard. In the buffalo packs, that is typically the file "
-        "containing `w600k` or `mbf` in its name."
+    print(f"Selected embedding model for Melange: {embedding_model}")
+    print("Run `export-melange` to generate the ONNX copy, sample input, and metadata bundle.")
+    return 0
+
+
+def command_export_melange(args: argparse.Namespace) -> int:
+    np = np_module()
+
+    model_pack = selected_model_pack(args)
+    app = load_face_analysis(model_pack)
+    model_dir = ensure_model_downloaded(model_pack)
+    embedding_model = select_embedding_model_path(model_dir)
+    model_info = inspect_onnx_model(embedding_model)
+
+    image_root = args.image_root.resolve()
+    sample_image = args.image.resolve() if args.image else find_default_sample_image(image_root)
+    output_dir = args.output_dir.resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    input_shape = model_info["input_shape"]
+    height, width, _ = resolve_input_hw(input_shape)
+    if height != width:
+        raise ValueError(
+            f"Expected square input for the embedding model, found {input_shape}."
+        )
+
+    face_crop = extract_face_crop(app, sample_image, image_size=height)
+    input_tensor = preprocess_face_for_embedding(face_crop, input_shape)
+
+    exported_model = output_dir / embedding_model.name
+    exported_input = output_dir / "face_embedding_input.npy"
+    exported_crop = output_dir / "sample_face_crop.png"
+    exported_metadata = output_dir / "melange_metadata.json"
+    exported_db = output_dir / "face_db.json"
+
+    shutil.copy2(embedding_model, exported_model)
+    np.save(exported_input, input_tensor)
+    write_image(exported_crop, face_crop)
+
+    if args.db.resolve().exists():
+        shutil.copy2(args.db.resolve(), exported_db)
+
+    metadata = {
+        "model_pack": model_pack,
+        "embedding_model": str(exported_model),
+        "sample_input": str(exported_input),
+        "sample_image": str(sample_image),
+        "sample_face_crop": str(exported_crop),
+        "input_name": model_info["input_name"],
+        "input_shape": input_shape,
+        "output_names": model_info["output_names"],
+        "output_shapes": model_info["output_shapes"],
+        "threshold": args.threshold,
+        "database_path": str(exported_db) if exported_db.exists() else None,
+        "zetic_cli_example": (
+            f"zetic gen -p YOUR_PROJECT_NAME -i {exported_input.name} {exported_model.name}"
+        ),
+    }
+    exported_metadata.write_text(json.dumps(metadata, indent=2, sort_keys=True))
+
+    print("Melange export bundle is ready.")
+    print(f"Model: {exported_model}")
+    print(f"Sample input (.npy): {exported_input}")
+    print(f"Sample face crop: {exported_crop}")
+    print(f"Metadata: {exported_metadata}")
+    if exported_db.exists():
+        print(f"Database copy: {exported_db}")
+    print("Next step:")
+    print(f"  cd {output_dir}")
+    print(f"  {metadata['zetic_cli_example']}")
+    return 0
+
+
+def command_export_detector_melange(args: argparse.Namespace) -> int:
+    np = np_module()
+
+    model_pack = selected_model_pack(args)
+    model_dir = ensure_model_downloaded(model_pack)
+    detection_model = select_detection_model_path(model_dir)
+    image_root = args.image_root.resolve()
+    sample_image = args.image.resolve() if args.image else find_default_sample_image(image_root)
+    output_dir = args.output_dir.resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    exported_model = output_dir / detection_model.name.replace(".onnx", "_fixed.onnx")
+    rewrite_onnx_input_shape(
+        detection_model,
+        exported_model,
+        [1, 3, args.image_size, args.image_size],
     )
+
+    input_tensor = preprocess_image_for_detection(load_image(sample_image), args.image_size)
+    exported_input = output_dir / "face_detection_input.npy"
+    np.save(exported_input, input_tensor)
+
+    model_info = inspect_onnx_model(exported_model)
+    exported_metadata = output_dir / "melange_detector_metadata.json"
+    metadata = {
+        "model_pack": model_pack,
+        "detection_model": str(exported_model),
+        "sample_input": str(exported_input),
+        "sample_image": str(sample_image),
+        "input_name": model_info["input_name"],
+        "input_shape": model_info["input_shape"],
+        "output_names": model_info["output_names"],
+        "output_shapes": model_info["output_shapes"],
+        "zetic_cli_example": (
+            f"zetic gen -p YOUR_PROJECT_NAME -i {exported_input.name} {exported_model.name}"
+        ),
+    }
+    exported_metadata.write_text(json.dumps(metadata, indent=2, sort_keys=True))
+
+    print("Melange detector export bundle is ready.")
+    print(f"Model: {exported_model}")
+    print(f"Sample input (.npy): {exported_input}")
+    print(f"Metadata: {exported_metadata}")
+    print("Next step:")
+    print(f"  cd {output_dir}")
+    print(f"  {metadata['zetic_cli_example']}")
     return 0
 
 
@@ -454,6 +796,72 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Embedding database path. Default: {DEFAULT_DB_PATH}",
     )
     build_db.set_defaults(func=command_build_db)
+
+    export_melange = subparsers.add_parser(
+        "export-melange",
+        help="Export the embedding ONNX model, sample input .npy, and metadata for Melange.",
+    )
+    add_model_selection_arguments(export_melange)
+    export_melange.add_argument(
+        "--image",
+        type=Path,
+        help="Optional sample image for the exported Melange input.",
+    )
+    export_melange.add_argument(
+        "--image-root",
+        type=Path,
+        default=DEFAULT_IMAGE_ROOT,
+        help=f"Image root to search when --image is not set. Default: {DEFAULT_IMAGE_ROOT}",
+    )
+    export_melange.add_argument(
+        "--output-dir",
+        type=Path,
+        default=DEFAULT_EXPORT_DIR,
+        help=f"Directory for Melange-ready export artifacts. Default: {DEFAULT_EXPORT_DIR}",
+    )
+    export_melange.add_argument(
+        "--db",
+        type=Path,
+        default=DEFAULT_DB_PATH,
+        help=f"Embedding database path to copy into the export bundle. Default: {DEFAULT_DB_PATH}",
+    )
+    export_melange.add_argument(
+        "--threshold",
+        type=float,
+        default=DEFAULT_THRESHOLD,
+        help=f"Cosine similarity threshold to store in metadata. Default: {DEFAULT_THRESHOLD}",
+    )
+    export_melange.set_defaults(func=command_export_melange)
+
+    export_detector = subparsers.add_parser(
+        "export-detector-melange",
+        help="Export a fixed-shape face detector ONNX model and sample input for Melange.",
+    )
+    add_model_selection_arguments(export_detector)
+    export_detector.add_argument(
+        "--image",
+        type=Path,
+        help="Optional sample image for the exported Melange detector input.",
+    )
+    export_detector.add_argument(
+        "--image-root",
+        type=Path,
+        default=DEFAULT_IMAGE_ROOT,
+        help=f"Image root to search when --image is not set. Default: {DEFAULT_IMAGE_ROOT}",
+    )
+    export_detector.add_argument(
+        "--output-dir",
+        type=Path,
+        default=DEFAULT_EXPORT_DIR,
+        help=f"Directory for Melange-ready export artifacts. Default: {DEFAULT_EXPORT_DIR}",
+    )
+    export_detector.add_argument(
+        "--image-size",
+        type=int,
+        default=DEFAULT_DETECTION_SIZE,
+        help=f"Fixed detector input size. Default: {DEFAULT_DETECTION_SIZE}",
+    )
+    export_detector.set_defaults(func=command_export_detector_melange)
 
     compare_cmd = subparsers.add_parser(
         "compare",

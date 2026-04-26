@@ -4,3 +4,4 @@
 __pycache__/
 *.pyc
 face_db.json
+melange_export/
