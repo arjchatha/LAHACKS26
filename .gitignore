@@ -1,5 +1,23 @@
-node_modules/
-dist/
-.env
 .DS_Store
-AGENTS.md
+
+# Local Python/runtime artifacts
+__pycache__/
+*.py[cod]
+.venv/
+.mplconfig/
+
+# Node dependencies
+node_modules/
+
+# Xcode user-local state
+*.xcuserstate
+*.xcuserdata/
+xcuserdata/
+
+# Local/generated face model assets for Melange upload
+FacialRecognition/
+*.onnx
+*.npy
+*.mlmodel
+*.mlpackage/
+*.zip
