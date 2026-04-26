@@ -49,9 +49,8 @@ struct PatientCameraView: View {
                 if viewModel.detectionResult.hasFace {
                     FaceBoundingBoxOverlay(
                         detection: viewModel.detectionResult,
-                        title: profileDisplay.title,
-                        description: profileDisplay.description,
-                        detailLines: profileDisplay.detailLines
+                        title: profileDisplay.cameraLabelTitle,
+                        description: profileDisplay.cameraLabelDescription
                     )
                         .frame(width: geometry.size.width, height: geometry.size.height)
                         .animation(.smooth(duration: 0.16), value: viewModel.detectionResult.boundingBox)
@@ -460,7 +459,6 @@ private struct FaceBoundingBoxOverlay: View {
     let detection: FaceDetectionResult
     let title: String
     let description: String
-    let detailLines: [String]
 
     var body: some View {
         GeometryReader { geometry in
@@ -481,7 +479,6 @@ private struct FaceBoundingBoxOverlay: View {
                         faceRect: fittedRect,
                         title: title,
                         description: description,
-                        detailLines: detailLines,
                         containerSize: geometry.size
                     )
                 }
@@ -494,7 +491,6 @@ private struct PersonDescriptionCallout: View {
     let faceRect: CGRect
     let title: String
     let description: String
-    let detailLines: [String]
     let containerSize: CGSize
 
     private let calloutWidth: CGFloat = 232
@@ -502,7 +498,7 @@ private struct PersonDescriptionCallout: View {
     private let horizontalInset: CGFloat = 18
 
     private var calloutHeight: CGFloat {
-        detailLines.isEmpty ? 78 : 124
+        description.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? 64 : 86
     }
 
     var body: some View {
@@ -516,8 +512,7 @@ private struct PersonDescriptionCallout: View {
 
             PersonDescriptionBubble(
                 title: title,
-                description: description,
-                detailLines: detailLines
+                description: description
             )
                 .frame(width: calloutWidth)
                 .position(placement.calloutCenter)
@@ -556,31 +551,21 @@ private struct PersonDescriptionCallout: View {
 private struct PersonDescriptionBubble: View {
     let title: String
     let description: String
-    let detailLines: [String]
 
     var body: some View {
+        let cleanedDescription = description.trimmingCharacters(in: .whitespacesAndNewlines)
         let content = VStack(alignment: .leading, spacing: 6) {
             Text(title)
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.white.opacity(0.72))
+                .font(.subheadline.weight(.bold))
+                .foregroundStyle(.white)
                 .lineLimit(1)
 
-            Text(description)
-                .font(.subheadline.weight(.semibold))
-                .foregroundStyle(.white)
-                .lineLimit(2)
-                .fixedSize(horizontal: false, vertical: true)
-
-            if !detailLines.isEmpty {
-                VStack(alignment: .leading, spacing: 3) {
-                    ForEach(detailLines.prefix(2), id: \.self) { line in
-                        Text(line)
-                            .font(.caption2.weight(.medium))
-                            .foregroundStyle(.white.opacity(0.72))
-                            .lineLimit(1)
-                    }
-                }
-                .padding(.top, 2)
+            if !cleanedDescription.isEmpty {
+                Text(cleanedDescription)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.white.opacity(0.74))
+                    .lineLimit(1)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)

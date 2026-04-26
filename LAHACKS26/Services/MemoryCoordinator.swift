@@ -30,7 +30,6 @@ private struct RollingTranscriptFragment: Equatable {
 
 private struct RollingFaceConversationBuffer: Equatable {
     var fragments: [RollingTranscriptFragment] = []
-    var conversationState: ConversationState = .empty
     var lastUpdatedAt: Date = .distantPast
 
     var combinedTranscript: String {
@@ -50,15 +49,28 @@ private struct RollingFaceConversationBuffer: Equatable {
     }
 }
 
+private struct TimestampedTranscriptSegment: Identifiable, Equatable {
+    let id = UUID()
+    let elapsedTime: TimeInterval
+    let speakerLabel: String
+    let text: String
+
+    var formattedLine: String {
+        "[\(Self.timecode(from: elapsedTime))] \(speakerLabel): \(text)"
+    }
+
+    private static func timecode(from elapsedTime: TimeInterval) -> String {
+        let totalSeconds = max(0, Int(elapsedTime.rounded()))
+        return String(format: "%02d:%02d", totalSeconds / 60, totalSeconds % 60)
+    }
+}
+
 @MainActor
 final class MemoryCoordinator: ObservableObject {
     @Published private(set) var latestEvent: MemoryCoordinatorEvent?
 
     private let memoryBridge: MemoryBridge
-    private let decisionEngine: LLMDecisionEngine
     private let localExtractor = LocalEpisodicMemoryExtractor()
-    private let capturePolicy = MemoryCapturePolicy()
-    private let shouldUseLLMRefinement = true
     private let conversationMergeGraceWindow: TimeInterval = 24
     private var faceProfileId: String
     private let faceConfidence: Double
@@ -67,27 +79,20 @@ final class MemoryCoordinator: ObservableObject {
     private var activeConversationFaceProfileId: String?
     private var rollingBuffersByFaceProfileId: [String: RollingFaceConversationBuffer] = [:]
     private var transcriptSegments: [TimestampedTranscriptSegment] = []
-    private var conversationState = ConversationState.empty
     private var currentTranscript = ""
     private var lastCommittedTranscript = ""
     private var lastStoredSignature = ""
     private var lastSavedEvidenceQuote = ""
     private var lastLocalSaveDate = Date.distantPast
-    private var needsLiveAnalysisRerun = false
-    private var liveAnalysisTask: Task<Void, Never>?
     private var transcriptCommitTask: Task<Void, Never>?
-    private var reconciliationTask: Task<Void, Never>?
-    private var finalAnalysisTask: Task<Void, Never>?
     private var conversationID: UUID?
 
     init(
         memoryBridge: MemoryBridge,
-        decisionEngine: LLMDecisionEngine? = nil,
         faceProfileId: String = "face-unassigned",
         faceConfidence: Double = 0.88
     ) {
         self.memoryBridge = memoryBridge
-        self.decisionEngine = decisionEngine ?? DefaultLLMDecisionEngineFactory.make()
         self.faceProfileId = faceProfileId
         self.faceConfidence = faceConfidence
     }
@@ -105,19 +110,13 @@ final class MemoryCoordinator: ObservableObject {
         lastCommittedTranscript = ""
         lastSavedEvidenceQuote = ""
         lastLocalSaveDate = .distantPast
-        needsLiveAnalysisRerun = false
-        liveAnalysisTask?.cancel()
         transcriptCommitTask?.cancel()
-        finalAnalysisTask?.cancel()
 
         if let activeConversationFaceProfileId {
             prepareRollingBufferForCurrentConversation(faceProfileId: activeConversationFaceProfileId)
-        } else {
-            conversationState = .empty
         }
 
         print("MindAnchor conversation: started face-bound transcription")
-        startReconciliationLoop()
     }
 
     func endFaceBoundConversation() {
@@ -126,14 +125,8 @@ final class MemoryCoordinator: ObservableObject {
         isConversationActive = false
         transcriptCommitTask?.cancel()
         commitCurrentTranscriptSnapshot()
-        liveAnalysisTask?.cancel()
-        liveAnalysisTask = nil
-        needsLiveAnalysisRerun = false
-        reconciliationTask?.cancel()
-        reconciliationTask = nil
 
         let fullTranscript = formattedTranscript()
-        let endedConversationID = conversationID
         guard !fullTranscript.isEmpty else {
             print("MindAnchor conversation: ended with no transcript")
             conversationID = nil
@@ -141,19 +134,9 @@ final class MemoryCoordinator: ObservableObject {
             return
         }
 
-        if shouldUseLLMRefinement {
-            print("MindAnchor conversation: ended, running final pass")
-            finalAnalysisTask = Task { [weak self] in
-                await self?.runFinalAnalysis(
-                    conversationID: endedConversationID,
-                    fullTranscript: fullTranscript
-                )
-            }
-        } else {
-            print("MindAnchor conversation: ended")
-            conversationID = nil
-            activeConversationFaceProfileId = nil
-        }
+        print("MindAnchor conversation: ended")
+        conversationID = nil
+        activeConversationFaceProfileId = nil
     }
 
     func submitTranscript(_ transcript: String) {
@@ -218,211 +201,11 @@ final class MemoryCoordinator: ObservableObject {
 
         lastCommittedTranscript = cleanedTranscript
         print("MindAnchor transcript snapshot:", segment.formattedLine)
-        if !shouldUseLLMRefinement, !storeLocalPersonIfNeeded(from: cleanedTranscript) {
-            storeLocalInteractionIfNeeded(from: cleanedTranscript)
-        }
-
-        if shouldUseLLMRefinement {
-            scheduleLiveAnalysis()
-        }
-    }
-
-    private func scheduleLiveAnalysis() {
-        guard liveAnalysisTask == nil else {
-            needsLiveAnalysisRerun = true
-            return
-        }
-
-        liveAnalysisTask = Task { [weak self] in
-            let conversationID = self?.conversationID
-            try? await Task.sleep(for: .milliseconds(900))
-            guard !Task.isCancelled else { return }
-
-            await self?.runLiveAnalysis(conversationID: conversationID)
-        }
-    }
-
-    private func startReconciliationLoop() {
-        reconciliationTask?.cancel()
-        reconciliationTask = Task { [weak self] in
-            while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(45))
-                guard !Task.isCancelled else { return }
-                guard self?.shouldUseLLMRefinement == true else { continue }
-
-                let conversationID = self?.conversationID
-                await self?.runReconciliationPass(conversationID: conversationID)
-            }
-        }
-    }
-
-    private func runLiveAnalysis(conversationID: UUID?) async {
-        defer {
-            liveAnalysisTask = nil
-            if needsLiveAnalysisRerun, isConversationActive {
-                needsLiveAnalysisRerun = false
-                scheduleLiveAnalysis()
-            }
-        }
-        guard isConversationActive, conversationID == self.conversationID else { return }
-
         let transcriptWindow = formattedTranscript()
-        guard !transcriptWindow.isEmpty else { return }
-
-        let result = await decisionEngine.updateConversationState(
-            previousState: conversationState,
-            recentTranscript: transcriptWindow
-        )
-        guard !Task.isCancelled, isConversationActive, conversationID == self.conversationID else { return }
-        conversationState = result.conversationState
-        persistConversationStateForActiveFace()
-
-        print("MindAnchor Apple model decision live:", result.decision)
-        printSaveScore(result.decision, phase: "live")
-        print("MindAnchor conversation state:", conversationState.promptJSON)
-        _ = processPolicyDecision(modelDecision: result.decision, transcript: transcriptWindow, phase: "live")
-    }
-
-    private func runReconciliationPass(conversationID: UUID?) async {
-        guard isConversationActive, conversationID == self.conversationID else { return }
-
-        let transcriptWindow = formattedTranscript()
-        guard !transcriptWindow.isEmpty else { return }
-
-        let result = await decisionEngine.reconcileConversationState(
-            previousState: conversationState,
-            transcriptWindow: transcriptWindow
-        )
-        guard !Task.isCancelled, isConversationActive, conversationID == self.conversationID else { return }
-        conversationState = result.conversationState
-        persistConversationStateForActiveFace()
-
-        print("MindAnchor Apple model decision reconciliation:", result.decision)
-        printSaveScore(result.decision, phase: "reconciliation")
-        print("MindAnchor conversation state:", conversationState.promptJSON)
-        _ = processPolicyDecision(modelDecision: result.decision, transcript: transcriptWindow, phase: "reconciliation")
-    }
-
-    private func runFinalAnalysis(conversationID: UUID?, fullTranscript: String) async {
-        guard conversationID == self.conversationID else { return }
-        let result = await decisionEngine.finalizeConversation(
-            previousState: conversationState,
-            fullTranscript: fullTranscript
-        )
-        guard !Task.isCancelled, conversationID == self.conversationID else { return }
-        conversationState = result.conversationState
-        persistConversationStateForActiveFace()
-
-        print("MindAnchor Apple model decision final:", result.decision)
-        printSaveScore(result.decision, phase: "final")
-        print("MindAnchor conversation state:", conversationState.promptJSON)
-        _ = processPolicyDecision(modelDecision: result.decision, transcript: fullTranscript, phase: "final")
-        self.conversationID = nil
-        self.activeConversationFaceProfileId = nil
-    }
-
-    private func processPolicyDecision(
-        modelDecision: TranscriptAnalysisDecision,
-        transcript: String,
-        phase: String
-    ) -> Bool {
-        print("MindAnchor policy transcript \(phase):", transcript)
-        let policyDecision = capturePolicy.evaluate(
-            modelDecision: modelDecision,
-            transcript: transcript,
-            activeMemory: activePersonMemoryForCurrentFace()
-        )
-        print("MindAnchor policy decision \(phase):", policyDecision)
-        printSaveScore(policyDecision.finalDecision, phase: "policy-\(phase)")
-
-        switch policyDecision.action {
-        case .ignore:
-            print("MindAnchor memory not saved by policy:", policyDecision.reason)
-            return false
-        case .acceptModel:
-            return storeIfNeeded(decision: policyDecision.finalDecision, transcript: transcript)
-        case let .storePersonCandidate(candidate):
-            return storeLocalPersonCandidate(candidate, transcript: transcript)
-        case let .updateActiveMemoryWithContext(candidate):
-            return storeLocalContextCandidate(candidate, transcript: transcript)
+        let parserInput = transcriptWindow.isEmpty ? cleanedTranscript : transcriptWindow
+        if !storeLocalPersonIfNeeded(from: parserInput) {
+            storeLocalInteractionIfNeeded(from: parserInput)
         }
-    }
-
-    private func storeIfNeeded(decision: TranscriptAnalysisDecision, transcript: String) -> Bool {
-        guard canStoreForActiveFace else { return false }
-        let minimumSaveScore = minimumSaveScore(for: decision)
-        guard decision.shouldStore, decision.memoryType != .none, decision.storageConfidence >= minimumSaveScore else {
-            print("MindAnchor memory not saved: saveScore=\(formattedScore(decision.storageConfidence)), shouldStore=\(decision.shouldStore), memoryType=\(decision.memoryType.rawValue)")
-            return false
-        }
-
-        if decision.memoryType != .person {
-            return storeInteractionIfNeeded(decision: decision, transcript: transcript)
-        }
-
-        guard isValidPersonDecision(decision, transcript: transcript) else {
-            if storeInteractionIfNeeded(decision: decision, transcript: transcript) {
-                return true
-            }
-
-            print("MindAnchor memory rejected: invalid person extraction:", decision)
-            return false
-        }
-        let extractedRelationship = decision.extractedRelationship
-        let extractedHelpfulContext = decision.extractedHelpfulContext
-            ?? (extractedRelationship == nil ? "No context captured yet" : nil)
-
-        let signature = [
-            faceProfileId,
-            decision.memoryType.rawValue,
-            decision.extractedName ?? "",
-            extractedRelationship ?? "",
-            extractedHelpfulContext ?? ""
-        ].joined(separator: "|").lowercased()
-        guard !signature.isEmpty, signature != lastStoredSignature else { return false }
-
-        latestEvent = MemoryCoordinatorEvent(
-            kind: .saving,
-            title: "Saving",
-            subtitle: nil,
-            patientSafeResponse: nil
-        )
-
-        guard let memory = memoryBridge.storePersonMemory(
-            transcript: transcript,
-            extractedName: decision.extractedName,
-            extractedRelationship: extractedRelationship,
-            extractedHelpfulContext: extractedHelpfulContext,
-            faceProfileId: faceProfileId,
-            confidence: faceConfidence
-        ) else {
-            latestEvent = nil
-            return false
-        }
-
-        lastStoredSignature = signature
-        print("MindAnchor memory saved:", memory.name)
-        _ = storeInteractionIfNeeded(decision: decision, transcript: transcript, shouldShowEvent: false)
-        Task { @MainActor in
-            try? await Task.sleep(for: .milliseconds(350))
-            latestEvent = MemoryCoordinatorEvent(
-                kind: .stored,
-                title: "Saved",
-                subtitle: memory.name,
-                patientSafeResponse: decision.patientSafeResponse ?? memoryBridge.recognizeStoredPerson(faceProfileId: faceProfileId)
-            )
-        }
-        return true
-    }
-
-    private func printSaveScore(_ decision: TranscriptAnalysisDecision, phase: String) {
-        print(
-            "MindAnchor saveScore \(phase): \(formattedScore(decision.storageConfidence)), shouldStore=\(decision.shouldStore), memoryType=\(decision.memoryType.rawValue)"
-        )
-    }
-
-    private func formattedScore(_ score: Double) -> String {
-        String(format: "%.2f", score)
     }
 
     private func mergedDraftField(
@@ -446,16 +229,15 @@ final class MemoryCoordinator: ObservableObject {
         return current.isEmpty ? (incoming ?? "") : current
     }
 
-    private func minimumSaveScore(for decision: TranscriptAnalysisDecision) -> Double {
-        if decision.memoryType == .person, cleanedDecisionField(decision.extractedName) != nil {
-            return 0.45
-        }
-
-        return 0.8
-    }
-
     private func storeLocalPersonIfNeeded(from transcript: String) -> Bool {
         guard canStoreForActiveFace else { return false }
+        if let activeMemory = activePersonMemoryForCurrentFace() {
+            return storeLocalContextForActiveMemoryIfNeeded(
+                from: transcript,
+                activeMemory: activeMemory
+            )
+        }
+
         guard let candidate = localExtractor.extractPersonProfile(from: transcript) else {
             return storeLocalContextForActiveDraftIfNeeded(from: transcript)
         }
@@ -547,17 +329,38 @@ final class MemoryCoordinator: ObservableObject {
         return storeLocalContextCandidate(contextCandidate, transcript: transcript)
     }
 
-    private func storeLocalContextCandidate(_ contextCandidate: LocalPersonContextCandidate, transcript: String) -> Bool {
+    private func storeLocalContextForActiveMemoryIfNeeded(
+        from transcript: String,
+        activeMemory: DemoPersonMemory
+    ) -> Bool {
+        guard let contextCandidate = localExtractor.extractPersonContext(from: transcript) else { return false }
+        return storeLocalContextCandidate(
+            contextCandidate,
+            transcript: transcript,
+            activeMemory: activeMemory
+        )
+    }
+
+    private func storeLocalContextCandidate(
+        _ contextCandidate: LocalPersonContextCandidate,
+        transcript: String,
+        activeMemory providedActiveMemory: DemoPersonMemory? = nil
+    ) -> Bool {
         guard canStoreForActiveFace else { return false }
-        guard let activeMemory = activePersonMemoryForCurrentFace() else {
+        guard let activeMemory = providedActiveMemory ?? activePersonMemoryForCurrentFace() else {
             return false
         }
 
-        let mergedRelationship = mergedDraftField(
-            currentValue: activeMemory.relationship,
-            incomingValue: contextCandidate.relationship,
-            emptyValues: ["Unknown", "person I met", "possible acquaintance"]
-        )
+        let relationshipIsLocked = hasAssignedRelationship(activeMemory.relationship)
+        guard !relationshipIsLocked || contextCandidate.helpfulContext != nil else { return false }
+
+        let mergedRelationship = relationshipIsLocked
+            ? activeMemory.relationship
+            : mergedDraftField(
+                currentValue: activeMemory.relationship,
+                incomingValue: contextCandidate.relationship,
+                emptyValues: ["Unknown", "person I met", "possible acquaintance"]
+            )
         let mergedHelpfulContext = mergedDraftField(
             currentValue: activeMemory.helpfulContext,
             incomingValue: contextCandidate.helpfulContext,
@@ -615,15 +418,6 @@ final class MemoryCoordinator: ObservableObject {
         memoryBridge.allPeople().first {
             $0.faceProfileId == faceProfileId &&
                 $0.status == .saved
-        }
-    }
-
-    private func storeLocalPersonFallbackIfNeeded(from transcript: String, reason: String) {
-        guard shouldUseLLMRefinement else { return }
-        print("MindAnchor fallback check:", reason)
-
-        if storeLocalPersonIfNeeded(from: transcript) {
-            print("MindAnchor fallback person memory saved after LLM miss")
         }
     }
 
@@ -692,69 +486,10 @@ final class MemoryCoordinator: ObservableObject {
         return true
     }
 
-    private func storeInteractionIfNeeded(
-        decision: TranscriptAnalysisDecision,
-        transcript: String,
-        shouldShowEvent: Bool = true
-    ) -> Bool {
-        guard canStoreForActiveFace else { return false }
-        guard isValidInteractionDecision(decision, transcript: transcript) else { return false }
-
-        let signature = [
-            faceProfileId,
-            decision.memoryType.rawValue,
-            decision.interactionSummary ?? "",
-            decision.evidenceQuote ?? "",
-            decision.retentionHint ?? ""
-        ].joined(separator: "|").lowercased()
-        guard !signature.isEmpty, signature != lastStoredSignature else { return false }
-
-        if shouldShowEvent {
-            latestEvent = MemoryCoordinatorEvent(
-                kind: .saving,
-                title: "Saving",
-                subtitle: nil,
-                patientSafeResponse: nil
-            )
-        }
-
-        guard let memory = memoryBridge.storeInteractionMemory(
-            memoryType: decision.memoryType.rawValue,
-            summary: decision.interactionSummary ?? "",
-            evidenceQuote: decision.evidenceQuote ?? "",
-            emotionalContext: decision.emotionalContext,
-            followUpContext: decision.followUpContext,
-            retentionHint: decision.retentionHint,
-            transcript: transcript,
-            faceProfileId: faceProfileId
-        ) else {
-            if shouldShowEvent {
-                latestEvent = nil
-            }
-            return false
-        }
-
-        lastStoredSignature = signature
-        print("MindAnchor interaction memory saved:", memory.summary)
-
-        guard shouldShowEvent else { return true }
-        Task { @MainActor in
-            try? await Task.sleep(for: .milliseconds(350))
-            latestEvent = MemoryCoordinatorEvent(
-                kind: .stored,
-                title: "Saved",
-                subtitle: nil,
-                patientSafeResponse: decision.patientSafeResponse ?? memory.summary
-            )
-        }
-        return true
-    }
-
     private func prepareRollingBufferForCurrentConversation(faceProfileId: String) {
         let now = Date()
         if let existingBuffer = rollingBuffersByFaceProfileId[faceProfileId],
            now.timeIntervalSince(existingBuffer.lastUpdatedAt) <= conversationMergeGraceWindow {
-            conversationState = existingBuffer.conversationState
             let combined = existingBuffer.combinedTranscriptForLogging
             if !combined.isEmpty {
                 print("MindAnchor conversation: resumed rolling buffer for \(faceProfileId)")
@@ -764,7 +499,6 @@ final class MemoryCoordinator: ObservableObject {
         }
 
         rollingBuffersByFaceProfileId[faceProfileId] = RollingFaceConversationBuffer(lastUpdatedAt: now)
-        conversationState = .empty
     }
 
     private func updateRollingTranscriptBuffer(with segment: TimestampedTranscriptSegment) {
@@ -776,7 +510,6 @@ final class MemoryCoordinator: ObservableObject {
         if now.timeIntervalSince(buffer.lastUpdatedAt) > conversationMergeGraceWindow,
            !buffer.fragments.contains(where: { $0.conversationID == conversationID }) {
             buffer = RollingFaceConversationBuffer()
-            buffer.conversationState = .empty
         }
 
         let cleanedText = segment.text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -798,14 +531,6 @@ final class MemoryCoordinator: ObservableObject {
         buffer.lastUpdatedAt = now
         rollingBuffersByFaceProfileId[faceProfileId] = buffer
         logCombinedTranscriptIfNeeded(for: faceProfileId, buffer: buffer)
-    }
-
-    private func persistConversationStateForActiveFace() {
-        guard let faceProfileId = activeConversationFaceProfileId ?? (canStoreForActiveFace ? self.faceProfileId : nil) else { return }
-        guard var buffer = rollingBuffersByFaceProfileId[faceProfileId] else { return }
-        buffer.conversationState = conversationState
-        buffer.lastUpdatedAt = Date()
-        rollingBuffersByFaceProfileId[faceProfileId] = buffer
     }
 
     private func logCombinedTranscriptIfNeeded(for faceProfileId: String, buffer: RollingFaceConversationBuffer) {
@@ -841,102 +566,16 @@ final class MemoryCoordinator: ObservableObject {
         !faceProfileId.isEmpty && faceProfileId != "face-unassigned"
     }
 
-    private func isValidPersonDecision(_ decision: TranscriptAnalysisDecision, transcript: String) -> Bool {
-        guard let name = cleanedDecisionField(decision.extractedName) else { return false }
-        let relationship = cleanedDecisionField(decision.extractedRelationship)
-        let helpfulContext = cleanedDecisionField(decision.extractedHelpfulContext)
-
-        let normalizedName = normalized(name)
-        guard !isGenericNamePlaceholder(normalizedName) else { return false }
-        guard transcript.localizedCaseInsensitiveContains(name) else { return false }
-
-        if let relationship, isGenericFieldPlaceholder(normalized(relationship)) {
-            return false
-        }
-
-        if let helpfulContext, isGenericFieldPlaceholder(normalized(helpfulContext)) {
-            return false
-        }
-
-        return true
-    }
-
-    private func isValidInteractionDecision(_ decision: TranscriptAnalysisDecision, transcript: String) -> Bool {
-        guard let summary = cleanedDecisionField(decision.interactionSummary) else { return false }
-        guard let evidenceQuote = cleanedDecisionField(decision.evidenceQuote) else { return false }
-        guard !isGenericFieldPlaceholder(normalized(summary)) else { return false }
-        guard !isGenericFieldPlaceholder(normalized(evidenceQuote)) else { return false }
-        guard transcript.localizedCaseInsensitiveContains(evidenceQuote) else { return false }
-
-        if let emotionalContext = cleanedDecisionField(decision.emotionalContext),
-           isGenericFieldPlaceholder(normalized(emotionalContext)) {
-            return false
-        }
-
-        if let followUpContext = cleanedDecisionField(decision.followUpContext),
-           isGenericFieldPlaceholder(normalized(followUpContext)) {
-            return false
-        }
-
-        return true
-    }
-
-    private func cleanedDecisionField(_ value: String?) -> String? {
-        let cleaned = value?.trimmingCharacters(in: .whitespacesAndNewlines)
-        return cleaned?.isEmpty == false ? cleaned : nil
-    }
-
-    private func normalized(_ value: String) -> String {
-        value
+    private func hasAssignedRelationship(_ value: String) -> Bool {
+        let normalized = value
             .lowercased()
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .filter { $0.isLetter || $0.isNumber || $0.isWhitespace }
-    }
-
-    private func isGenericNamePlaceholder(_ value: String) -> Bool {
-        [
-            "person",
-            "name",
-            "relationship",
-            "context",
-            "speaker",
-            "speaker a",
-            "conversation",
-            "transcript",
-            "someone",
-            "somebody",
+            .trimmingCharacters(in: .whitespacesAndNewlines.union(.punctuationCharacters))
+        return ![
+            "",
             "unknown",
-            "friend",
-            "patient",
-            "memory",
-            "interactionsummary",
-            "event",
-            "prototype",
-            "response"
-        ].contains(value)
-    }
-
-    private func isGenericFieldPlaceholder(_ value: String) -> Bool {
-        [
-            "person",
-            "name",
-            "relationship",
-            "context",
-            "speaker",
-            "speaker a",
-            "speaker label",
-            "conversation",
-            "transcript",
-            "someone",
-            "somebody",
-            "unknown",
-            "patient",
-            "memory",
-            "interactionsummary",
-            "event",
-            "prototype",
-            "response"
-        ].contains(value)
+            "person i met",
+            "possible acquaintance"
+        ].contains(normalized)
     }
 }
 
@@ -968,128 +607,6 @@ private struct LocalPersonContextCandidate {
 
     var displayContext: String {
         helpfulContext ?? relationship ?? "context"
-    }
-}
-
-private struct MemoryCapturePolicyDecision: CustomStringConvertible {
-    enum Action {
-        case ignore
-        case acceptModel
-        case storePersonCandidate(LocalPersonProfileCandidate)
-        case updateActiveMemoryWithContext(LocalPersonContextCandidate)
-    }
-
-    var action: Action
-    var finalDecision: TranscriptAnalysisDecision
-    var reason: String
-
-    var description: String {
-        let actionName: String
-        switch action {
-        case .ignore:
-            actionName = "ignore"
-        case .acceptModel:
-            actionName = "acceptModel"
-        case let .storePersonCandidate(candidate):
-            actionName = "storePersonCandidate(\(candidate.name))"
-        case let .updateActiveMemoryWithContext(candidate):
-            actionName = "updateActiveMemoryWithContext(\(candidate.displayContext))"
-        }
-
-        return "action=\(actionName), reason=\(reason), finalDecision=[\(finalDecision)]"
-    }
-}
-
-private struct MemoryCapturePolicy {
-    private let extractor = LocalEpisodicMemoryExtractor()
-
-    func evaluate(
-        modelDecision: TranscriptAnalysisDecision,
-        transcript: String,
-        activeMemory: DemoPersonMemory?
-    ) -> MemoryCapturePolicyDecision {
-        if let personCandidate = extractor.extractPersonProfile(from: transcript) {
-            return MemoryCapturePolicyDecision(
-                action: .storePersonCandidate(personCandidate),
-                finalDecision: decision(for: personCandidate),
-                reason: personCandidate.hasDurableContext
-                    ? "policy found identity with useful context"
-                    : "policy found self-introduction candidate"
-            )
-        }
-
-        if activeMemory != nil, let contextCandidate = extractor.extractPersonContext(from: transcript) {
-            return MemoryCapturePolicyDecision(
-                action: .updateActiveMemoryWithContext(contextCandidate),
-                finalDecision: decision(for: contextCandidate, activeMemory: activeMemory),
-                reason: "policy found context for active memory"
-            )
-        }
-
-        if shouldAcceptModel(modelDecision) {
-            return MemoryCapturePolicyDecision(
-                action: .acceptModel,
-                finalDecision: modelDecision,
-                reason: "model decision passed policy"
-            )
-        }
-
-        return MemoryCapturePolicyDecision(
-            action: .ignore,
-            finalDecision: modelDecision,
-            reason: "no durable memory evidence"
-        )
-    }
-
-    private func shouldAcceptModel(_ decision: TranscriptAnalysisDecision) -> Bool {
-        guard decision.shouldStore, decision.memoryType != .none else { return false }
-
-        if decision.memoryType == .person {
-            return decision.extractedName != nil && decision.storageConfidence >= 0.45
-        }
-
-        return decision.storageConfidence >= 0.8 &&
-            decision.interactionSummary != nil &&
-            decision.evidenceQuote != nil
-    }
-
-    private func decision(for candidate: LocalPersonProfileCandidate) -> TranscriptAnalysisDecision {
-        TranscriptAnalysisDecision(
-            shouldStore: true,
-            memoryType: .person,
-            importance: candidate.hasDurableContext ? .medium : .low,
-            storageConfidence: candidate.hasDurableContext ? 0.78 : 0.58,
-            extractedName: candidate.name,
-            extractedRelationship: candidate.relationship == "Unknown" ? nil : candidate.relationship,
-            extractedHelpfulContext: candidate.helpfulContext == "Not captured yet" ? nil : candidate.helpfulContext,
-            interactionSummary: nil,
-            evidenceQuote: candidate.evidenceQuote,
-            emotionalContext: nil,
-            followUpContext: nil,
-            retentionHint: candidate.hasDurableContext ? "recent" : "identity",
-            patientSafeResponse: nil
-        )
-    }
-
-    private func decision(
-        for candidate: LocalPersonContextCandidate,
-        activeMemory: DemoPersonMemory?
-    ) -> TranscriptAnalysisDecision {
-        TranscriptAnalysisDecision(
-            shouldStore: true,
-            memoryType: .person,
-            importance: .medium,
-            storageConfidence: 0.72,
-            extractedName: activeMemory?.name,
-            extractedRelationship: candidate.relationship,
-            extractedHelpfulContext: candidate.helpfulContext,
-            interactionSummary: nil,
-            evidenceQuote: candidate.evidenceQuote,
-            emotionalContext: nil,
-            followUpContext: nil,
-            retentionHint: "recent",
-            patientSafeResponse: nil
-        )
     }
 }
 
@@ -1200,13 +717,6 @@ private struct LocalEpisodicMemoryExtractor {
         }
 
         return nil
-    }
-
-    func shouldSendToLLM(_ transcript: String) -> Bool {
-        let cleaned = cleanedTranscript(from: transcript)
-        guard cleaned.split(whereSeparator: \.isWhitespace).count >= 4 else { return false }
-        guard !containsBlockedLanguage(cleaned) else { return false }
-        return true
     }
 
     private func cleanedTranscript(from transcript: String) -> String {

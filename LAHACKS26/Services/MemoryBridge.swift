@@ -107,6 +107,24 @@ enum PersonProfileDisplayResult: Equatable {
     case known(PersonProfileDisplay)
     case unknown(String)
 
+    var cameraLabelTitle: String {
+        switch self {
+        case let .known(profile):
+            profile.name
+        case .unknown:
+            "Unknown"
+        }
+    }
+
+    var cameraLabelDescription: String {
+        switch self {
+        case let .known(profile):
+            profile.relationship
+        case .unknown:
+            ""
+        }
+    }
+
     var title: String {
         switch self {
         case let .known(profile):
@@ -187,6 +205,7 @@ protocol MemoryBridge: AnyObject {
         sourceImages: [UIImage]
     ) throws -> PersonProfileDisplay
     func deletePhotoProfile(personId: String)
+    func clearMemory()
     func updatePersonMemory(
         personId: String,
         name: String,
@@ -213,7 +232,8 @@ final class MockMemoryBridge: ObservableObject, MemoryBridge {
     @Published private(set) var enrolledPhotoProfiles: [StoredPersonPhotoProfile] = []
     @Published private(set) var enrolledLiveProfiles: [StoredLivePersonProfile] = []
 
-    private let faceRecognitionService = try? FaceRecognitionService()
+    private var faceRecognitionService: FaceRecognitionService?
+    private var didFailToLoadFaceRecognitionService = false
     private var embeddingsByFaceProfileId: [String: [Float]] = [:]
 
     init() {
@@ -233,25 +253,43 @@ final class MockMemoryBridge: ObservableObject, MemoryBridge {
             return nil
         }
 
+        let evidenceEntries = transcriptEvidenceEntries(from: transcript)
         let personId = stablePersonId(for: name, faceProfileId: faceProfileId)
         let relationship = clean(extractedRelationship, fallback: "Unknown")
-        let helpfulContext = clean(extractedHelpfulContext, fallback: "Not captured yet")
+        let helpfulContext = preferredHelpfulContext(
+            current: extractedHelpfulContext,
+            transcriptEvidence: evidenceEntries,
+            name: name
+        )
         let prompt = patientPrompt(
             name: name,
             relationship: relationship,
             helpfulContext: helpfulContext
         )
-        let evidenceEntries = transcriptEvidenceEntries(from: transcript)
         let now = Date()
 
         if let index = people.firstIndex(where: {
             $0.id == personId ||
+                $0.faceProfileId == faceProfileId ||
                 ($0.name.caseInsensitiveCompare(name) == .orderedSame && ($0.faceProfileId == nil || $0.faceProfileId == faceProfileId))
         }) {
-            people[index].name = name
-            people[index].relationship = relationship
-            people[index].helpfulContext = helpfulContext
-            people[index].patientPrompt = prompt
+            let lockedName = lockedIdentityName(existing: people[index].name, incoming: name)
+            let lockedRelationship = lockedRelationship(existing: people[index].relationship, incoming: relationship)
+            let lockedHelpfulContext = preferredHelpfulContext(
+                current: extractedHelpfulContext ?? people[index].helpfulContext,
+                transcriptEvidence: evidenceEntries,
+                name: lockedName
+            )
+            let lockedPrompt = patientPrompt(
+                name: lockedName,
+                relationship: lockedRelationship,
+                helpfulContext: lockedHelpfulContext
+            )
+
+            people[index].name = lockedName
+            people[index].relationship = lockedRelationship
+            people[index].helpfulContext = lockedHelpfulContext
+            people[index].patientPrompt = lockedPrompt
             for evidenceEntry in evidenceEntries {
                 appendTranscriptEvidence(evidenceEntry, to: index)
             }
@@ -343,7 +381,7 @@ final class MockMemoryBridge: ObservableObject, MemoryBridge {
                 faceProfileId: faceProfileId,
                 name: person.name,
                 relationship: ["person I met", "possible acquaintance", "Unknown"].contains(person.relationship) ? "" : person.relationship,
-                memoryCue: recognizeStoredPerson(faceProfileId: faceProfileId),
+                memoryCue: liveDisplaySummary(for: person, recentInteraction: recentInteraction),
                 detailLines: detailLines
             )
         )
@@ -358,8 +396,8 @@ final class MockMemoryBridge: ObservableObject, MemoryBridge {
         }
 
         guard
-            let faceRecognitionService,
             !embeddingsByFaceProfileId.isEmpty,
+            let faceRecognitionService = faceRecognitionServiceInstance(),
             let embedding = try? faceRecognitionService.liveEmbedding(from: pixelBuffer, detection: detection)
         else {
             return nil
@@ -377,7 +415,7 @@ final class MockMemoryBridge: ObservableObject, MemoryBridge {
     }
 
     func faceEmbedding(for detection: FaceDetectionResult, in pixelBuffer: CVPixelBuffer) -> [Float]? {
-        guard detection.hasFace, let faceRecognitionService else { return nil }
+        guard detection.hasFace, let faceRecognitionService = faceRecognitionServiceInstance() else { return nil }
         return try? faceRecognitionService.liveEmbedding(from: pixelBuffer, detection: detection)
     }
 
@@ -399,13 +437,17 @@ final class MockMemoryBridge: ObservableObject, MemoryBridge {
         }
 
         let now = Date()
+        let matchingLiveIndex = bestExistingLiveProfileIndex(for: embedding)
         let existingLiveIndex = enrolledLiveProfiles.firstIndex {
             $0.profile.name.localizedCaseInsensitiveCompare(cleanName) == .orderedSame
-        }
+        } ?? matchingLiveIndex
         let existingLiveProfile = existingLiveIndex.map { enrolledLiveProfiles[$0] }
         let existingPerson = people.first {
-            $0.name.localizedCaseInsensitiveCompare(cleanName) == .orderedSame && $0.status == .saved
+            $0.status == .saved &&
+                ($0.name.localizedCaseInsensitiveCompare(cleanName) == .orderedSame ||
+                    (existingLiveProfile?.profile.faceProfileId != nil && $0.faceProfileId == existingLiveProfile?.profile.faceProfileId))
         }
+        let displayName = existingLiveProfile.map { preferredStoredName(existing: $0.profile.name, incoming: cleanName) } ?? cleanName
         let personId = existingLiveProfile?.profile.personId
             ?? existingPerson?.id
             ?? "person-live-\(UUID().uuidString.prefix(8))"
@@ -422,12 +464,17 @@ final class MockMemoryBridge: ObservableObject, MemoryBridge {
             FaceEmbeddingMath.l2Normalized(average([$0.embedding, embedding]))
         } ?? embedding
         let faceSampleCount = (existingLiveProfile?.faceSampleCount ?? 0) + embeddings.count
+        let helpfulContext = preferredHelpfulContext(
+            current: existingPerson?.helpfulContext,
+            transcriptEvidence: mergedEvidence,
+            name: displayName
+        )
         let profile = PersonProfileDisplay(
             personId: personId,
             faceProfileId: faceProfileId,
-            name: cleanName,
+            name: displayName,
             relationship: relationship,
-            memoryCue: memoryCue(for: cleanName, transcriptEvidence: mergedEvidence),
+            memoryCue: helpfulContext,
             detailLines: detailLines(faceSampleCount: faceSampleCount, transcriptEvidence: mergedEvidence)
         )
         let storedProfile = StoredLivePersonProfile(
@@ -448,9 +495,9 @@ final class MockMemoryBridge: ObservableObject, MemoryBridge {
         embeddingsByFaceProfileId[faceProfileId] = mergedEmbedding
         _ = storePersonMemory(
             transcript: mergedEvidence.joined(separator: "\n"),
-            extractedName: cleanName,
+            extractedName: displayName,
             extractedRelationship: relationship.isEmpty ? nil : relationship,
-            extractedHelpfulContext: profile.memoryCue,
+            extractedHelpfulContext: helpfulContext,
             faceProfileId: faceProfileId,
             confidence: 1.0
         )
@@ -472,7 +519,11 @@ final class MockMemoryBridge: ObservableObject, MemoryBridge {
                 faceProfileId: existing.profile.faceProfileId,
                 name: existing.profile.name,
                 relationship: existing.profile.relationship,
-                memoryCue: memoryCue(for: existing.profile.name, transcriptEvidence: mergedEvidence),
+                memoryCue: preferredHelpfulContext(
+                    current: existing.profile.memoryCue,
+                    transcriptEvidence: mergedEvidence,
+                    name: existing.profile.name
+                ),
                 detailLines: detailLines(faceSampleCount: existing.faceSampleCount, transcriptEvidence: mergedEvidence)
             )
 
@@ -491,6 +542,17 @@ final class MockMemoryBridge: ObservableObject, MemoryBridge {
         for evidenceEntry in evidenceEntries {
             appendTranscriptEvidence(evidenceEntry, to: personIndex)
         }
+        let helpfulContext = preferredHelpfulContext(
+            current: people[personIndex].helpfulContext,
+            transcriptEvidence: people[personIndex].transcriptEvidence,
+            name: people[personIndex].name
+        )
+        people[personIndex].helpfulContext = helpfulContext
+        people[personIndex].patientPrompt = patientPrompt(
+            name: people[personIndex].name,
+            relationship: people[personIndex].relationship,
+            helpfulContext: helpfulContext
+        )
         people[personIndex].updatedAt = Date()
     }
 
@@ -513,7 +575,7 @@ final class MockMemoryBridge: ObservableObject, MemoryBridge {
         guard !cleanName.isEmpty, !sourceImages.isEmpty else {
             throw ProfilePhotoStorageError.invalidEmbeddingData
         }
-        guard let faceRecognitionService else {
+        guard let faceRecognitionService = faceRecognitionServiceInstance() else {
             throw FaceRecognitionError.embeddingModelUnavailable("The face embedding model is not available.")
         }
 
@@ -613,6 +675,27 @@ final class MockMemoryBridge: ObservableObject, MemoryBridge {
         }
 
         try? saveStoredPhotoProfiles()
+    }
+
+    func clearMemory() {
+        people.removeAll()
+        interactions.removeAll()
+        enrolledPhotoProfiles.removeAll()
+        enrolledLiveProfiles.removeAll()
+        embeddingsByFaceProfileId.removeAll()
+        faceRecognitionService = nil
+        didFailToLoadFaceRecognitionService = false
+
+        let fileManager = FileManager.default
+        if let profileDirectoryURL = try? profilePhotoDirectoryURL(),
+           fileManager.fileExists(atPath: profileDirectoryURL.path) {
+            try? fileManager.removeItem(at: profileDirectoryURL)
+        }
+
+        if let liveProfileDirectoryURL = try? liveProfileDirectoryURL(),
+           fileManager.fileExists(atPath: liveProfileDirectoryURL.path) {
+            try? fileManager.removeItem(at: liveProfileDirectoryURL)
+        }
     }
 
     func updatePersonMemory(
@@ -898,9 +981,7 @@ final class MockMemoryBridge: ObservableObject, MemoryBridge {
     private func transcriptEvidenceEntries(from transcript: String) -> [String] {
         let entries = transcript
             .components(separatedBy: .newlines)
-            .map(Self.cleanEvidenceQuote(_:))
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines.union(.punctuationCharacters)) }
-            .filter { !$0.isEmpty }
+            .compactMap(Self.normalizedEvidenceEntry(_:))
 
         let uniqueEntries = entries.reduce(into: [String]()) { result, entry in
             guard !result.contains(entry) else { return }
@@ -913,17 +994,15 @@ final class MockMemoryBridge: ObservableObject, MemoryBridge {
     private func liveTranscriptEvidenceEntries(from transcript: String) -> [String] {
         let entries = transcript
             .components(separatedBy: CharacterSet(charactersIn: ".!?\n"))
-            .map(Self.cleanEvidenceQuote(_:))
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines.union(.punctuationCharacters)) }
-            .filter { $0.count >= 3 }
+            .compactMap(Self.normalizedEvidenceEntry(_:))
 
         let uniqueEntries = uniqueTranscriptEvidence(entries)
         if !uniqueEntries.isEmpty {
             return uniqueEntries
         }
 
-        let fallback = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
-        return fallback.isEmpty ? [] : [fallback]
+        guard let fallback = Self.normalizedEvidenceEntry(transcript) else { return [] }
+        return [fallback]
     }
 
     private func uniqueTranscriptEvidence(_ entries: [String]) -> [String] {
@@ -931,9 +1010,9 @@ final class MockMemoryBridge: ObservableObject, MemoryBridge {
         var uniqueEntries: [String] = []
 
         for entry in entries {
-            let cleanEntry = entry.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let cleanEntry = Self.normalizedEvidenceEntry(entry) else { continue }
             let key = cleanEntry.lowercased()
-            guard !cleanEntry.isEmpty, !seen.contains(key) else { continue }
+            guard !seen.contains(key) else { continue }
             seen.insert(key)
             uniqueEntries.append(cleanEntry)
         }
@@ -958,12 +1037,96 @@ final class MockMemoryBridge: ObservableObject, MemoryBridge {
             : relationship
     }
 
-    private func memoryCue(for name: String, transcriptEvidence: [String]) -> String {
-        guard let latestEvidence = transcriptEvidence.last, !latestEvidence.isEmpty else {
-            return "This is \(name)."
+    private func bestExistingLiveProfileIndex(for embedding: [Float]) -> Int? {
+        let scoredProfiles = enrolledLiveProfiles.indices.compactMap { index -> (index: Int, similarity: Float)? in
+            guard let similarity = FaceEmbeddingMath.cosineSimilarity(embedding, enrolledLiveProfiles[index].embedding) else {
+                return nil
+            }
+
+            return (index, similarity)
+        }
+        .sorted { $0.similarity > $1.similarity }
+
+        guard let best = scoredProfiles.first, best.similarity >= 0.58 else {
+            return nil
         }
 
-        return "This is \(name). They introduced themselves by saying: \"\(latestEvidence)\""
+        return best.index
+    }
+
+    private func preferredStoredName(existing: String, incoming: String) -> String {
+        let cleanedExisting = existing.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanedIncoming = incoming.trimmingCharacters(in: .whitespacesAndNewlines)
+        if cleanedExisting.isEmpty || cleanedExisting.localizedCaseInsensitiveContains("unknown") {
+            return cleanedIncoming
+        }
+
+        return cleanedExisting
+    }
+
+    private func lockedIdentityName(existing: String, incoming: String) -> String {
+        let cleanedExisting = existing.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanedIncoming = incoming.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard !cleanedExisting.isEmpty, !cleanedExisting.localizedCaseInsensitiveContains("unknown") else {
+            return cleanedIncoming
+        }
+
+        return cleanedExisting
+    }
+
+    private func lockedRelationship(existing: String, incoming: String) -> String {
+        let cleanedExisting = existing.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanedIncoming = incoming.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard Self.isUnassignedRelationship(cleanedExisting) else {
+            return cleanedExisting
+        }
+
+        return cleanedIncoming.isEmpty ? "Unknown" : cleanedIncoming
+    }
+
+    private func preferredHelpfulContext(
+        current: String?,
+        transcriptEvidence: [String],
+        name: String
+    ) -> String {
+        if let inferredContext = importantContext(from: transcriptEvidence, name: name) {
+            return inferredContext
+        }
+
+        let cleanedCurrent = current?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let cleanedCurrent,
+           !cleanedCurrent.isEmpty,
+           !Self.isLowValueHelpfulContext(cleanedCurrent, name: name) {
+            return Self.punctuated(cleanedCurrent)
+        }
+
+        return "No key details yet."
+    }
+
+    private func faceRecognitionServiceInstance() -> FaceRecognitionService? {
+        if let faceRecognitionService {
+            return faceRecognitionService
+        }
+
+        guard !didFailToLoadFaceRecognitionService else {
+            return nil
+        }
+
+        do {
+            let service = try FaceRecognitionService()
+            faceRecognitionService = service
+            return service
+        } catch {
+            didFailToLoadFaceRecognitionService = true
+            print("MindAnchor face recognition model unavailable:", error.localizedDescription)
+            return nil
+        }
+    }
+
+    private func memoryCue(for name: String, transcriptEvidence: [String]) -> String {
+        preferredHelpfulContext(current: nil, transcriptEvidence: transcriptEvidence, name: name)
     }
 
     private func detailLines(faceSampleCount: Int, transcriptEvidence: [String]) -> [String] {
@@ -998,7 +1161,7 @@ final class MockMemoryBridge: ObservableObject, MemoryBridge {
     }
 
     private func patientPrompt(name: String, relationship: String, helpfulContext: String) -> String {
-        let context = helpfulContext == "No helpful context captured yet." || helpfulContext == "Not captured yet"
+        let context = Self.isEmptyHelpfulContext(helpfulContext)
             ? ""
             : " \(helpfulContext.asPatientPromptSentenceWithPronoun)"
 
@@ -1017,6 +1180,18 @@ final class MockMemoryBridge: ObservableObject, MemoryBridge {
         return interaction.summary
     }
 
+    private func liveDisplaySummary(for person: DemoPersonMemory, recentInteraction: InteractionMemory?) -> String {
+        if !Self.isEmptyHelpfulContext(person.helpfulContext) {
+            return Self.punctuated(person.helpfulContext)
+        }
+
+        if let recentInteraction {
+            return Self.punctuated(recentInteraction.summary)
+        }
+
+        return "No key details yet."
+    }
+
     private func profileDetailLines(for person: DemoPersonMemory, recentInteraction: InteractionMemory?) -> [String] {
         var lines: [String] = []
 
@@ -1024,8 +1199,7 @@ final class MockMemoryBridge: ObservableObject, MemoryBridge {
             lines.append(person.relationship)
         }
 
-        if person.helpfulContext != "No helpful context captured yet.",
-           person.helpfulContext != "Not captured yet",
+        if !Self.isEmptyHelpfulContext(person.helpfulContext),
            !person.helpfulContext.lowercased().contains("introduced during the conversation") {
             lines.append(person.helpfulContext)
         }
@@ -1035,6 +1209,22 @@ final class MockMemoryBridge: ObservableObject, MemoryBridge {
         }
 
         return lines
+    }
+
+    private func importantContext(from transcriptEvidence: [String], name: String) -> String? {
+        for evidence in transcriptEvidence.reversed() {
+            guard let cleanedEvidence = Self.normalizedEvidenceEntry(evidence) else { continue }
+
+            if let context = Self.contextAfterIntroduction(in: cleanedEvidence, name: name) {
+                return context
+            }
+
+            if let context = Self.contextFromStandaloneStatement(cleanedEvidence) {
+                return context
+            }
+        }
+
+        return nil
     }
 
     private func markdownPage(for person: DemoPersonMemory) -> String {
@@ -1111,7 +1301,163 @@ final class MockMemoryBridge: ObservableObject, MemoryBridge {
             with: "",
             options: .regularExpression
         )
+        .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
         .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func normalizedEvidenceEntry(_ transcript: String) -> String? {
+        let cleaned = cleanEvidenceQuote(transcript)
+            .trimmingCharacters(in: .whitespacesAndNewlines.union(.punctuationCharacters))
+        guard !cleaned.isEmpty, !isLowValueEvidence(cleaned) else { return nil }
+        return cleaned
+    }
+
+    private static func isLowValueEvidence(_ text: String) -> Bool {
+        let normalized = text
+            .lowercased()
+            .trimmingCharacters(in: .whitespacesAndNewlines.union(.punctuationCharacters))
+        let lowValueExact = [
+            "yeah", "yes", "yep", "okay", "ok", "sure", "right", "she", "he", "they",
+            "this", "that", "can you say", "say that", "repeat that", "what", "hello",
+            "hi", "hey", "no transcript evidence captured"
+        ]
+        if lowValueExact.contains(normalized) {
+            return true
+        }
+
+        return normalized.count < 3
+    }
+
+    private static func isEmptyHelpfulContext(_ value: String) -> Bool {
+        let normalized = value
+            .lowercased()
+            .trimmingCharacters(in: .whitespacesAndNewlines.union(.punctuationCharacters))
+        return [
+            "",
+            "not captured yet",
+            "no key details yet",
+            "no helpful context captured yet",
+            "face profile ready for recognition"
+        ].contains(normalized)
+    }
+
+    private static func isUnassignedRelationship(_ value: String) -> Bool {
+        let normalized = value
+            .lowercased()
+            .trimmingCharacters(in: .whitespacesAndNewlines.union(.punctuationCharacters))
+        return [
+            "",
+            "unknown",
+            "person i met",
+            "possible acquaintance"
+        ].contains(normalized)
+    }
+
+    private static func isLowValueHelpfulContext(_ value: String, name: String) -> Bool {
+        let normalized = value
+            .lowercased()
+            .trimmingCharacters(in: .whitespacesAndNewlines.union(.punctuationCharacters))
+        guard !isEmptyHelpfulContext(value) else { return true }
+        if normalized.contains("introduced themselves by saying") {
+            return true
+        }
+        if normalized == "this is \(name.lowercased())" {
+            return true
+        }
+        if normalized.hasPrefix("this is \(name.lowercased()). they introduced") {
+            return true
+        }
+        return isLowValueEvidence(value)
+    }
+
+    private static func contextAfterIntroduction(in text: String, name: String) -> String? {
+        let cleaned = strippedFillerPrefix(from: text)
+        let escapedName = NSRegularExpression.escapedPattern(for: name)
+        let pattern = #"(?i)\b(?:i\s+am|i'm|im|my\s+name\s+is|this\s+is)\s+\#(escapedName)\b(?:\s*(?:,|and|\.)\s*)?(.*)$"#
+        guard
+            let regex = try? NSRegularExpression(pattern: pattern),
+            let match = regex.firstMatch(
+                in: cleaned,
+                range: NSRange(cleaned.startIndex..<cleaned.endIndex, in: cleaned)
+            ),
+            match.numberOfRanges > 1,
+            let range = Range(match.range(at: 1), in: cleaned)
+        else {
+            return nil
+        }
+
+        let remainder = String(cleaned[range])
+        return normalizedContext(from: remainder)
+    }
+
+    private static func contextFromStandaloneStatement(_ text: String) -> String? {
+        normalizedContext(from: strippedFillerPrefix(from: text))
+    }
+
+    private static func normalizedContext(from rawText: String) -> String? {
+        var text = strippedFillerPrefix(from: rawText)
+            .trimmingCharacters(in: .whitespacesAndNewlines.union(.punctuationCharacters))
+        text = text.replacingOccurrences(of: #"(?i)^(?:and|but|so)\s+"#, with: "", options: .regularExpression)
+        guard !text.isEmpty, !isLowValueEvidence(text) else { return nil }
+
+        let lowercased = text.lowercased()
+        guard !lowercased.contains("introduced themselves by saying") else {
+            return nil
+        }
+
+        if lowercased.hasPrefix("i'm ") || lowercased.hasPrefix("i am ") || lowercased.hasPrefix("im ") {
+            let prefix = lowercased.hasPrefix("i am ") ? 5 : lowercased.hasPrefix("i'm ") ? 4 : 3
+            let remainder = String(text.dropFirst(prefix))
+                .trimmingCharacters(in: .whitespacesAndNewlines.union(.punctuationCharacters))
+            guard !remainder.isEmpty else { return nil }
+            if remainder.lowercased().split(separator: " ").first?.hasSuffix("ing") == true {
+                return punctuated(remainder)
+            }
+            return punctuated("is \(remainder)")
+        }
+
+        let replacements: [(String, String)] = [
+            ("i like to ", "likes to "),
+            ("i love to ", "loves to "),
+            ("i like ", "likes "),
+            ("i love ", "loves "),
+            ("i prefer ", "prefers "),
+            ("i play ", "plays "),
+            ("i watch ", "watches "),
+            ("i go to ", "goes to "),
+            ("i live ", "lives "),
+            ("i work ", "works "),
+            ("i study ", "studies "),
+            ("we go to the same school", "goes to the same school"),
+            ("we go to same school", "goes to the same school")
+        ]
+
+        for (prefix, replacement) in replacements where lowercased.hasPrefix(prefix) {
+            let remainder = String(text.dropFirst(prefix.count))
+                .trimmingCharacters(in: .whitespacesAndNewlines.union(.punctuationCharacters))
+            return punctuated("\(replacement)\(remainder)")
+        }
+
+        return punctuated(text)
+    }
+
+    private static func strippedFillerPrefix(from text: String) -> String {
+        text.replacingOccurrences(
+            of: #"(?i)^\s*(?:oh|yeah|yes|yep|okay|ok|um|uh|like)\s*,?\s+"#,
+            with: "",
+            options: .regularExpression
+        )
+    }
+
+    private static func punctuated(_ value: String) -> String {
+        let cleaned = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleaned.isEmpty else { return cleaned }
+
+        if cleaned.rangeOfCharacter(from: CharacterSet(charactersIn: ".!?"), options: .backwards)?.upperBound == cleaned.endIndex {
+            return cleaned
+        }
+
+        return "\(cleaned)."
     }
 
     private static let localDateTime: DateFormatter = {
@@ -1128,9 +1474,25 @@ private extension String {
         guard !trimmed.isEmpty else { return "" }
 
         let lowercased = trimmed.lowercased()
-        let sentence = lowercased.hasPrefix("she ") || lowercased.hasPrefix("he ") || lowercased.hasPrefix("they ")
-            ? trimmed
-            : "She \(trimmed)"
+        let sentence: String
+        if lowercased.hasPrefix("this is ") {
+            sentence = trimmed
+        } else if lowercased.hasPrefix("he ") ||
+                    lowercased.hasPrefix("she ") ||
+                    lowercased.hasPrefix("they ") ||
+                    lowercased.hasPrefix("this person ") {
+            sentence = trimmed
+        } else if lowercased.hasPrefix("is ") ||
+                    lowercased.hasPrefix("was ") ||
+                    lowercased.hasPrefix("can ") ||
+                    lowercased.hasPrefix("cannot ") ||
+                    lowercased.hasPrefix("can't ") {
+            sentence = "This person \(trimmed)"
+        } else if lowercased.split(separator: " ").first?.hasSuffix("ing") == true {
+            sentence = "This person is \(trimmed)"
+        } else {
+            sentence = "This person \(trimmed)"
+        }
 
         let terminalPunctuation = CharacterSet(charactersIn: ".!?")
         if sentence.rangeOfCharacter(from: terminalPunctuation, options: .backwards)?.upperBound == sentence.endIndex {

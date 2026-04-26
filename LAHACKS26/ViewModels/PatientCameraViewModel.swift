@@ -111,17 +111,17 @@ final class PatientCameraViewModel: ObservableObject {
         lastFrameProcessDate = now
         isProcessingFrame = true
 
-        let sendablePixelBuffer = SendableFramePixelBuffer(value: pixelBuffer)
+        let retainedPixelBuffer = RetainedFramePixelBuffer(pixelBuffer)
         Task { [weak self] in
             guard let self else { return }
 
             let results = await self.faceDetectionService.detectFaces(
-                in: sendablePixelBuffer.value,
+                in: retainedPixelBuffer.value,
                 isUsingFrontCamera: isUsingFrontCamera
             )
 
             await MainActor.run {
-                self.handleDetectionResults(results, pixelBuffer: sendablePixelBuffer.value)
+                self.handleDetectionResults(results, pixelBuffer: retainedPixelBuffer.value)
                 self.isProcessingFrame = false
             }
         }
@@ -186,6 +186,17 @@ final class PatientCameraViewModel: ObservableObject {
         guard detectionResult.hasFace else { return }
 
         if let name = introducedName(in: cleanedTranscript) {
+            if var session = enrollmentSession {
+                session.transcript = cleanedTranscript
+                enrollmentSession = session
+                return
+            }
+
+            if let faceProfileId = detectionResult.faceProfileId {
+                memoryBridge.appendTranscript(cleanedTranscript, to: faceProfileId)
+                return
+            }
+
             if enrollmentSession?.name.localizedCaseInsensitiveCompare(name) != .orderedSame {
                 enrollmentSession = LiveEnrollmentSession(name: name, transcript: cleanedTranscript)
                 enrollmentNoFaceStreak = 0
@@ -452,8 +463,12 @@ final class PatientCameraViewModel: ObservableObject {
     }
 }
 
-private struct SendableFramePixelBuffer: @unchecked Sendable {
+private final class RetainedFramePixelBuffer: @unchecked Sendable {
     let value: CVPixelBuffer
+
+    nonisolated init(_ value: CVPixelBuffer) {
+        self.value = value
+    }
 }
 
 private extension CGRect {

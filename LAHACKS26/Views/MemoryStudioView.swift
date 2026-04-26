@@ -15,6 +15,7 @@ struct MemoryStudioView: View {
     @State private var selectedPersonId: String?
     @State private var isWikiExpanded = false
     @State private var editingPerson: DemoPersonMemory?
+    @State private var isShowingClearMemoryConfirmation = false
 
     private var visiblePeople: [DemoPersonMemory] {
         searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -31,12 +32,16 @@ struct MemoryStudioView: View {
         return visiblePeople.first
     }
 
+    private var hasStoredMemory: Bool {
+        !memoryBridge.allPeople().isEmpty || !memoryBridge.recentInteractions().isEmpty
+    }
+
     var body: some View {
         NavigationStack {
             ZStack {
                 MemoryStudioBackground()
 
-                ScrollView {
+                ScrollView(.vertical, showsIndicators: true) {
                     VStack(alignment: .leading, spacing: 18) {
                         header
                         controls
@@ -53,11 +58,15 @@ struct MemoryStudioView: View {
                         }
 
                         recentInteractions
+                        clearMemoryButton
                     }
                     .padding(.horizontal, 18)
                     .padding(.top, 18)
                     .padding(.bottom, 118)
+                    .frame(maxWidth: .infinity, alignment: .topLeading)
                 }
+                .scrollBounceBehavior(.basedOnSize, axes: .vertical)
+                .clipped()
             }
             .navigationBarTitleDisplayMode(.inline)
             .toolbar(.hidden, for: .navigationBar)
@@ -66,6 +75,15 @@ struct MemoryStudioView: View {
         .sheet(item: $editingPerson) { person in
             MemoryEditSheet(memoryBridge: memoryBridge, person: person)
                 .preferredColorScheme(.dark)
+        }
+        .alert("Clear Memory?", isPresented: $isShowingClearMemoryConfirmation) {
+            Button("Clear Memory", role: .destructive) {
+                clearMemory()
+            }
+
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This deletes all stored faces, embeddings, profiles, and memory information on this device.")
         }
     }
 
@@ -206,6 +224,25 @@ struct MemoryStudioView: View {
         }
     }
 
+    private var clearMemoryButton: some View {
+        Button(role: .destructive) {
+            isShowingClearMemoryConfirmation = true
+        } label: {
+            Label("Clear Memory", systemImage: "trash")
+                .font(.headline.weight(.bold))
+                .foregroundStyle(hasStoredMemory ? .red : .white.opacity(0.42))
+                .frame(maxWidth: .infinity)
+                .frame(height: 56)
+                .memoryGlass(
+                    in: RoundedRectangle(cornerRadius: 22, style: .continuous),
+                    tint: hasStoredMemory ? .red.opacity(0.10) : .white.opacity(0.035)
+                )
+        }
+        .buttonStyle(.plain)
+        .disabled(!hasStoredMemory)
+        .accessibilityLabel("Clear Memory")
+    }
+
     private var emptyState: some View {
         VStack(spacing: 12) {
             Image(systemName: "book.pages")
@@ -237,6 +274,14 @@ struct MemoryStudioView: View {
 
         return "Memories"
     }
+
+    private func clearMemory() {
+        memoryBridge.clearMemory()
+        searchText = ""
+        selectedPersonId = nil
+        isWikiExpanded = false
+        editingPerson = nil
+    }
 }
 
 private struct MemoryStudioAdaptiveLayout<ListContent: View, DetailContent: View>: View {
@@ -255,9 +300,12 @@ private struct MemoryStudioAdaptiveLayout<ListContent: View, DetailContent: View
 
             VStack(alignment: .leading, spacing: 16) {
                 list()
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 detail()
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
+        .frame(maxWidth: .infinity, alignment: .topLeading)
     }
 }
 
@@ -307,6 +355,7 @@ private struct PersonMemoryCard: View {
             RoundedRectangle(cornerRadius: 30, style: .continuous)
                 .stroke(isSelected ? .white.opacity(0.34) : .white.opacity(0.06), lineWidth: 1)
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
@@ -359,23 +408,6 @@ private struct PersonDetailCard: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
 
-            DetailSection(title: "Transcript Evidence", symbol: "quote.bubble") {
-                VStack(alignment: .leading, spacing: 10) {
-                    ForEach(Array(person.transcriptEvidence.enumerated()), id: \.offset) { index, transcript in
-                        VStack(alignment: .leading, spacing: 5) {
-                            Text("Transcript \(index + 1)")
-                                .font(.caption.weight(.bold))
-                                .foregroundStyle(.white.opacity(0.54))
-
-                            Text(transcript)
-                                .font(.callout.weight(.medium))
-                                .foregroundStyle(.white.opacity(0.82))
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-                    }
-                }
-            }
-
             if let wikiPage {
                 DisclosureGroup(isExpanded: $isWikiExpanded) {
                     Text(wikiPage)
@@ -394,14 +426,12 @@ private struct PersonDetailCard: View {
         }
         .padding(18)
         .memoryGlass(in: RoundedRectangle(cornerRadius: 32, style: .continuous), tint: .white.opacity(0.065))
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private var detailGrid: some View {
         VStack(spacing: 10) {
             DetailRow(title: "Helpful Context", value: person.helpfulContext, symbol: "sparkles")
-            DetailRow(title: "Status", value: person.status.displayName, symbol: "checkmark.shield")
-            DetailRow(title: "Recognition", value: person.recognitionStatus == .availableForRecognition ? "Available" : "Unavailable", symbol: "faceid")
-            DetailRow(title: "Face Profile", value: person.faceProfileId ?? "None", symbol: "camera.viewfinder")
             if let lastEditedAt = person.lastEditedAt {
                 DetailRow(
                     title: "Last Edit",

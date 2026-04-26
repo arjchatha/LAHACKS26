@@ -8,6 +8,7 @@
 @preconcurrency import AVFoundation
 import Combine
 import CoreGraphics
+import CoreVideo
 
 @MainActor
 final class CameraManager: NSObject, ObservableObject {
@@ -182,12 +183,12 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate {
             return
         }
 
-        let sendablePixelBuffer = SendablePixelBuffer(value: pixelBuffer)
+        let retainedPixelBuffer = RetainedPixelBuffer(pixelBuffer)
         Task { @MainActor [weak self] in
             guard let self else { return }
 
-            self.latestPixelBuffer = sendablePixelBuffer.value
-            self.onFrame?(sendablePixelBuffer.value, self.isUsingFrontCamera)
+            self.latestPixelBuffer = retainedPixelBuffer.value
+            self.onFrame?(retainedPixelBuffer.value, self.isUsingFrontCamera)
         }
     }
 }
@@ -213,6 +214,10 @@ private enum CameraError: LocalizedError {
     }
 }
 
-private struct SendablePixelBuffer: @unchecked Sendable {
+private final class RetainedPixelBuffer: @unchecked Sendable {
     let value: CVPixelBuffer
+
+    nonisolated init(_ value: CVPixelBuffer) {
+        self.value = value
+    }
 }

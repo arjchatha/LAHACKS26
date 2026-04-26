@@ -13,6 +13,7 @@ node_modules/
 *.xcuserstate
 *.xcuserdata/
 xcuserdata/
+LAHACKS26.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved
 
 # Local/generated face model assets for Melange upload
 FacialRecognition/
