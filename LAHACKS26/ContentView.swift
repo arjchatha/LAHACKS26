@@ -30,37 +30,68 @@ struct ContentView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .ignoresSafeArea()
 
-            rootSwitchButton
+            rootNavigationBar
         }
         .ignoresSafeArea()
         .background(Color.black.ignoresSafeArea())
     }
 
-    private var rootSwitchButton: some View {
-        Button {
-            withAnimation(.smooth(duration: 0.22)) {
-                activeView = activeView == .camera ? .memoryStudio : .camera
-            }
-        } label: {
-            Label(activeView == .camera ? "Memory Studio" : "Patient Camera", systemImage: activeView == .camera ? "book.pages.fill" : "camera.viewfinder")
-                .font(.callout.weight(.bold))
-                .foregroundStyle(.white)
-                .padding(.horizontal, 16)
-                .padding(.vertical, 12)
-                .background(.black.opacity(0.38), in: Capsule())
-                .overlay {
-                    Capsule()
-                        .stroke(.white.opacity(0.22), lineWidth: 1)
+    private var rootNavigationBar: some View {
+        HStack(spacing: 8) {
+            ForEach(RootViewMode.allCases, id: \.self) { mode in
+                Button {
+                    withAnimation(.smooth(duration: 0.22)) {
+                        activeView = mode
+                    }
+                } label: {
+                    Label(mode.title, systemImage: mode.symbol)
+                        .font(.caption.weight(.bold))
+                        .foregroundStyle(.white)
+                        .labelStyle(.titleAndIcon)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.8)
+                        .padding(.horizontal, 12)
+                        .frame(height: 42)
+                        .background(activeView == mode ? .white.opacity(0.18) : .white.opacity(0.06), in: Capsule())
+                        .overlay {
+                            Capsule()
+                                .stroke(.white.opacity(activeView == mode ? 0.28 : 0.12), lineWidth: 1)
+                        }
                 }
-                .shadow(color: .black.opacity(0.26), radius: 16, y: 8)
+                .buttonStyle(.plain)
+                .accessibilityLabel("Open \(mode.title)")
+            }
         }
-        .buttonStyle(.plain)
-        .accessibilityLabel(activeView == .camera ? "Open Memory Studio" : "Return to Patient Camera")
+        .padding(6)
+        .background(.black.opacity(0.42), in: Capsule())
+        .overlay {
+            Capsule()
+                .stroke(.white.opacity(0.18), lineWidth: 1)
+        }
+        .shadow(color: .black.opacity(0.26), radius: 16, y: 8)
         .padding(.bottom, 18)
     }
 }
 
-private enum RootViewMode {
+private enum RootViewMode: CaseIterable {
     case camera
     case memoryStudio
+
+    var title: String {
+        switch self {
+        case .camera:
+            "Camera"
+        case .memoryStudio:
+            "Memories"
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .camera:
+            "camera.viewfinder"
+        case .memoryStudio:
+            "book.pages.fill"
+        }
+    }
 }

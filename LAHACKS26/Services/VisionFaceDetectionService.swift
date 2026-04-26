@@ -8,7 +8,6 @@
 import CoreGraphics
 import CoreVideo
 import ImageIO
-import Foundation
 import Vision
 
 actor AppleVisionFaceDetectionService {
@@ -18,42 +17,11 @@ actor AppleVisionFaceDetectionService {
         static let maximumFaceArea: CGFloat = 0.85
         static let minimumAspectRatio: CGFloat = 0.35
         static let maximumAspectRatio: CGFloat = 2.6
-        static let modelBackedFaceMatchDistance: Float = 0.34
-        static let modelBackedProfileSampleDistance: Float = 0.18
-        static let modelBackedPendingFaceDistance: Float = 0.42
-        static let localFaceMatchDistance: Float = 0.16
-        static let localProfileSampleDistance: Float = 0.08
-        static let localPendingFaceDistance: Float = 0.24
-        static let localRecentReturnDistance: Float = 0.36
-        static let recentReturnWindow: TimeInterval = 18
-        static let maximumSamplesPerProfile = 5
-        static let maximumStoredProfiles = 12
-    }
-
-    private struct LocalFaceProfile {
-        var id: String
-        var embeddings: [FaceEmbedding]
-        var sightings: Int
-        var lastSeen: Date
-    }
-
-    private struct PendingFaceProfile {
-        var id: String
-        var embedding: FaceEmbedding
-        var sightings: Int
-        var lastSeen: Date
+        static let maximumTrackedFaces = 1
     }
 
     private let sequenceHandler = VNSequenceRequestHandler()
     private let detectionRequest: VNDetectFaceRectanglesRequest
-    private let embeddingProvider = HybridFaceEmbeddingProvider()
-    private var localFaceProfiles: [LocalFaceProfile] = []
-    private var pendingFaceProfile: PendingFaceProfile?
-    private var identityStabilizer = FaceIdentityStabilizer(requiredConsecutiveFrames: 2)
-    private var nextFaceProfileIndex = 1
-    private var didLogEmbeddingProvider = false
-    private var lastResolvedProfileId: String?
-    private var lastResolvedProfileDate = Date.distantPast
 
     init() {
         let request = VNDetectFaceRectanglesRequest()
@@ -63,53 +31,41 @@ actor AppleVisionFaceDetectionService {
     }
 
     func prepare() async {
-        logEmbeddingProviderIfNeeded()
+        // Apple Vision ships with iOS, so there is no model download for the live detector.
     }
 
-    func detectFace(in pixelBuffer: CVPixelBuffer, isUsingFrontCamera _: Bool) async -> FaceDetectionResult {
-        if let detectedResult = detectNewFace(in: pixelBuffer) {
-            return detectedResult
-        }
-
-        pendingFaceProfile = nil
-        identityStabilizer.reset()
-        return .none
-    }
-
-    private func detectNewFace(in pixelBuffer: CVPixelBuffer) -> FaceDetectionResult? {
+    func detectFaces(in pixelBuffer: CVPixelBuffer, isUsingFrontCamera _: Bool) async -> [FaceDetectionResult] {
         do {
             try sequenceHandler.perform([detectionRequest], on: pixelBuffer, orientation: .up)
         } catch {
-            return nil
+            return []
         }
 
-        guard
-            let observations = detectionRequest.results,
-            let bestFace = observations
-                .filter(isPlausibleFace(_:))
-                .max(by: { score($0) < score($1) })
-        else {
-            return nil
+        guard let observations = detectionRequest.results else {
+            return []
         }
 
-        let candidateProfileId = candidateFaceProfileId(
-            in: pixelBuffer,
-            visionBoundingBox: bestFace.boundingBox
-        )
-        let stableProfileId = identityStabilizer.resolvedProfileId(for: candidateProfileId)
-        let displayProfileId = stableProfileId ?? recoveringProfileId(for: candidateProfileId)
+        let imageSize = sourceSize(from: pixelBuffer)
+        return observations
+            .filter(isPlausibleFace(_:))
+            .sorted { lhs, rhs in
+                let lhsCenterX = lhs.boundingBox.midX
+                let rhsCenterX = rhs.boundingBox.midX
 
-        if let displayProfileId {
-            lastResolvedProfileId = displayProfileId
-            lastResolvedProfileDate = Date()
-        }
+                if abs(lhsCenterX - rhsCenterX) > 0.06 {
+                    return lhsCenterX < rhsCenterX
+                }
 
-        return FaceDetectionResult.detected(
-            confidence: Double(bestFace.confidence),
-            boundingBox: normalizedTopLeftRect(from: bestFace.boundingBox),
-            sourceImageSize: sourceSize(from: pixelBuffer),
-            faceProfileId: displayProfileId
-        )
+                return score(lhs) > score(rhs)
+            }
+            .prefix(Constants.maximumTrackedFaces)
+            .map { observation in
+                FaceDetectionResult.detected(
+                    confidence: Double(observation.confidence),
+                    boundingBox: normalizedTopLeftRect(from: observation.boundingBox),
+                    sourceImageSize: imageSize
+                )
+            }
     }
 
     private func isPlausibleFace(_ observation: VNFaceObservation) -> Bool {
@@ -128,165 +84,6 @@ actor AppleVisionFaceDetectionService {
         let box = observation.boundingBox
         let area = box.width * box.height
         return CGFloat(observation.confidence) * pow(area, 0.18)
-    }
-
-    private func candidateFaceProfileId(in pixelBuffer: CVPixelBuffer, visionBoundingBox: CGRect) -> String? {
-        logEmbeddingProviderIfNeeded()
-
-        guard let embedding = embeddingProvider.embedding(in: pixelBuffer, visionBoundingBox: visionBoundingBox) else {
-            return nil
-        }
-
-        let faceMatchDistance = embeddingProvider.isModelBacked ?
-            Constants.modelBackedFaceMatchDistance :
-            Constants.localFaceMatchDistance
-        let profileSampleDistance = embeddingProvider.isModelBacked ?
-            Constants.modelBackedProfileSampleDistance :
-            Constants.localProfileSampleDistance
-        let pendingFaceDistance = embeddingProvider.isModelBacked ?
-            Constants.modelBackedPendingFaceDistance :
-            Constants.localPendingFaceDistance
-
-        if let match = closestProfile(to: embedding), match.distance <= faceMatchDistance {
-            pendingFaceProfile = nil
-            if match.distance <= profileSampleDistance {
-                appendSample(embedding, toProfileAt: match.index)
-            }
-            localFaceProfiles[match.index].sightings += 1
-            localFaceProfiles[match.index].lastSeen = Date()
-            return localFaceProfiles[match.index].id
-        }
-
-        if
-            !embeddingProvider.isModelBacked,
-            let recentMatch = closestRecentProfile(to: embedding),
-            recentMatch.distance <= Constants.localRecentReturnDistance
-        {
-            pendingFaceProfile = nil
-            appendSample(embedding, toProfileAt: recentMatch.index)
-            localFaceProfiles[recentMatch.index].sightings += 1
-            localFaceProfiles[recentMatch.index].lastSeen = Date()
-            return localFaceProfiles[recentMatch.index].id
-        }
-
-        if let pendingFaceProfile {
-            let distance = embedding.cosineDistance(to: pendingFaceProfile.embedding)
-
-            if distance <= pendingFaceDistance {
-                var updatedPending = pendingFaceProfile
-                updatedPending.embedding = embedding
-                updatedPending.sightings += 1
-                updatedPending.lastSeen = Date()
-                self.pendingFaceProfile = updatedPending
-
-                if updatedPending.sightings >= identityStabilizer.requiredConsecutiveFrames {
-                    localFaceProfiles.append(
-                        LocalFaceProfile(
-                            id: updatedPending.id,
-                            embeddings: [updatedPending.embedding, embedding],
-                            sightings: updatedPending.sightings,
-                            lastSeen: updatedPending.lastSeen
-                        )
-                    )
-                    self.pendingFaceProfile = nil
-                    trimStoredProfilesIfNeeded()
-                }
-
-                return updatedPending.id
-            }
-        }
-
-        let profileId = String(format: "face-local-%03d", nextFaceProfileIndex)
-        nextFaceProfileIndex += 1
-        pendingFaceProfile = PendingFaceProfile(
-            id: profileId,
-            embedding: embedding,
-            sightings: 1,
-            lastSeen: Date()
-        )
-        return profileId
-    }
-
-    private func recoveringProfileId(for candidateProfileId: String?) -> String? {
-        guard
-            let candidateProfileId,
-            let lastResolvedProfileId,
-            candidateProfileId == lastResolvedProfileId,
-            Date().timeIntervalSince(lastResolvedProfileDate) <= Constants.recentReturnWindow
-        else {
-            return nil
-        }
-
-        return lastResolvedProfileId
-    }
-
-    private func closestProfile(to embedding: FaceEmbedding) -> (index: Int, distance: Float)? {
-        var bestMatch: (index: Int, distance: Float)?
-
-        for index in localFaceProfiles.indices {
-            for storedEmbedding in localFaceProfiles[index].embeddings {
-                let distance = embedding.cosineDistance(to: storedEmbedding)
-
-                if bestMatch == nil || distance < bestMatch!.distance {
-                    bestMatch = (index, distance)
-                }
-            }
-        }
-
-        return bestMatch
-    }
-
-    private func closestRecentProfile(to embedding: FaceEmbedding) -> (index: Int, distance: Float)? {
-        let now = Date()
-        var bestMatch: (index: Int, distance: Float)?
-
-        for index in localFaceProfiles.indices {
-            guard now.timeIntervalSince(localFaceProfiles[index].lastSeen) <= Constants.recentReturnWindow else {
-                continue
-            }
-
-            if let centroid = FaceEmbedding.mean(of: localFaceProfiles[index].embeddings) {
-                let distance = embedding.cosineDistance(to: centroid)
-                if bestMatch == nil || distance < bestMatch!.distance {
-                    bestMatch = (index, distance)
-                }
-            }
-        }
-
-        return bestMatch
-    }
-
-    private func trimStoredProfilesIfNeeded() {
-        guard localFaceProfiles.count > Constants.maximumStoredProfiles else { return }
-
-        localFaceProfiles.sort {
-            if $0.sightings == $1.sightings {
-                return $0.lastSeen > $1.lastSeen
-            }
-
-            return $0.sightings > $1.sightings
-        }
-        localFaceProfiles = Array(localFaceProfiles.prefix(Constants.maximumStoredProfiles))
-    }
-
-    private func appendSample(_ embedding: FaceEmbedding, toProfileAt index: Int) {
-        localFaceProfiles[index].embeddings.append(embedding)
-        if localFaceProfiles[index].embeddings.count > Constants.maximumSamplesPerProfile {
-            localFaceProfiles[index].embeddings.removeFirst(
-                localFaceProfiles[index].embeddings.count - Constants.maximumSamplesPerProfile
-            )
-        }
-    }
-
-    private func logEmbeddingProviderIfNeeded() {
-        guard !didLogEmbeddingProvider else { return }
-        didLogEmbeddingProvider = true
-
-        if embeddingProvider.isModelBacked {
-            print("MindAnchor face identity: using bundled Core ML face embedding model")
-        } else {
-            print("MindAnchor face identity: FaceEmbedding.mlmodelc not bundled; using local face appearance embeddings")
-        }
     }
 
     private func normalizedTopLeftRect(from visionRect: CGRect) -> CGRect {
@@ -321,131 +118,5 @@ private extension CGRect {
             width: max(0, maxX - minX),
             height: max(0, maxY - minY)
         )
-    }
-
-    nonisolated func paddedBy(_ amount: CGFloat) -> CGRect {
-        insetBy(dx: -width * amount, dy: -height * amount)
-    }
-}
-
-struct FaceEmbedding: Equatable {
-    var values: [Float]
-
-    nonisolated func cosineDistance(to other: FaceEmbedding) -> Float {
-        let count = min(values.count, other.values.count)
-        guard count > 0 else { return 1 }
-
-        var dotProduct: Float = 0
-        var leftMagnitude: Float = 0
-        var rightMagnitude: Float = 0
-
-        for index in 0..<count {
-            let left = values[index]
-            let right = other.values[index]
-            dotProduct += left * right
-            leftMagnitude += left * left
-            rightMagnitude += right * right
-        }
-
-        guard leftMagnitude > 0, rightMagnitude > 0 else { return 1 }
-
-        let similarity = dotProduct / (sqrt(leftMagnitude) * sqrt(rightMagnitude))
-        return 1 - max(-1, min(1, similarity))
-    }
-
-    nonisolated static func mean(of embeddings: [FaceEmbedding]) -> FaceEmbedding? {
-        guard let first = embeddings.first else { return nil }
-
-        var totals = Array(repeating: Float(0), count: first.values.count)
-        var contributingEmbeddings = 0
-
-        for embedding in embeddings where embedding.values.count == totals.count {
-            contributingEmbeddings += 1
-            for index in totals.indices {
-                totals[index] += embedding.values[index]
-            }
-        }
-
-        guard contributingEmbeddings > 0 else { return nil }
-
-        return FaceEmbedding(values: totals.map { $0 / Float(contributingEmbeddings) })
-    }
-}
-
-private struct HybridFaceEmbeddingProvider {
-    nonisolated var isModelBacked: Bool {
-        false
-    }
-
-    nonisolated init() {}
-
-    nonisolated func embedding(in pixelBuffer: CVPixelBuffer, visionBoundingBox: CGRect) -> FaceEmbedding? {
-        let width = max(1, CVPixelBufferGetWidth(pixelBuffer))
-        let height = max(1, CVPixelBufferGetHeight(pixelBuffer))
-        let box = visionBoundingBox.clampedToUnitRect()
-
-        let features: [Float] = [
-            Float(box.midX),
-            Float(box.midY),
-            Float(box.width),
-            Float(box.height),
-            Float(box.width * box.height),
-            Float(width) / 10_000,
-            Float(height) / 10_000,
-            Float(box.minX),
-            Float(box.minY),
-            Float(box.maxX),
-            Float(box.maxY),
-            Float(box.width / max(box.height, 0.001)),
-            Float((box.midX - 0.5) * 2),
-            Float((box.midY - 0.5) * 2),
-            Float(sqrt(box.width * box.height)),
-            1
-        ]
-
-        return FaceEmbedding(values: features)
-    }
-}
-
-struct FaceIdentityStabilizer {
-    let requiredConsecutiveFrames: Int
-    private(set) var stableProfileId: String?
-    private var candidateProfileId: String?
-    private var candidateFrameCount = 0
-
-    nonisolated init(requiredConsecutiveFrames: Int) {
-        self.requiredConsecutiveFrames = requiredConsecutiveFrames
-    }
-
-    nonisolated mutating func resolvedProfileId(for profileId: String?) -> String? {
-        guard let profileId else {
-            reset()
-            return nil
-        }
-
-        if profileId == stableProfileId {
-            return stableProfileId
-        }
-
-        if profileId == candidateProfileId {
-            candidateFrameCount += 1
-        } else {
-            candidateProfileId = profileId
-            candidateFrameCount = 1
-            stableProfileId = nil
-        }
-
-        if candidateFrameCount >= max(1, requiredConsecutiveFrames) {
-            stableProfileId = profileId
-            return profileId
-        }
-
-        return nil
-    }
-
-    nonisolated mutating func reset() {
-        stableProfileId = nil
-        candidateProfileId = nil
-        candidateFrameCount = 0
     }
 }

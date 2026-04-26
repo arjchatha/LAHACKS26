@@ -10,7 +10,7 @@ import UIKit
 
 struct PatientCameraView: View {
     @ObservedObject var memoryBridge: MockMemoryBridge
-    @StateObject private var viewModel = PatientCameraViewModel()
+    @StateObject private var viewModel: PatientCameraViewModel
     @StateObject private var speechService = AppleSpeechTranscriptionService()
     @StateObject private var memoryCoordinator: MemoryCoordinator
     @StateObject private var textToSpeechService = TextToSpeechService()
@@ -25,6 +25,7 @@ struct PatientCameraView: View {
 
     init(memoryBridge: MockMemoryBridge) {
         self.memoryBridge = memoryBridge
+        _viewModel = StateObject(wrappedValue: PatientCameraViewModel(memoryBridge: memoryBridge))
         _memoryCoordinator = StateObject(wrappedValue: MemoryCoordinator(memoryBridge: memoryBridge))
     }
 
@@ -63,6 +64,20 @@ struct PatientCameraView: View {
                         .padding(.horizontal, 22)
                 }
 
+                if let activeEnrollmentName = viewModel.activeEnrollmentName {
+                    VStack {
+                        Spacer()
+                        EnrollmentStatusPill(
+                            name: activeEnrollmentName,
+                            progress: viewModel.activeEnrollmentProgress,
+                            target: viewModel.activeEnrollmentTarget
+                        )
+                        .padding(.bottom, 92)
+                    }
+                    .frame(width: geometry.size.width, height: geometry.size.height)
+                    .allowsHitTesting(false)
+                }
+
                 VStack(spacing: 0) {
                     if let saveBanner {
                         SaveBannerView(
@@ -97,11 +112,13 @@ struct PatientCameraView: View {
             handleFaceBoundStateChanged()
         }
         .onChange(of: viewModel.detectionResult.faceProfileId) { _, faceProfileId in
-            memoryCoordinator.updateActiveFaceProfileId(faceProfileId)
             handleFaceProfileChanged(to: faceProfileId)
         }
         .onChange(of: speechService.transcript) { _, transcript in
-            memoryCoordinator.submitTranscript(transcript)
+            viewModel.handleTranscriptUpdate(transcript)
+            if activeTranscriptionFaceProfileId != nil {
+                memoryCoordinator.submitTranscript(transcript)
+            }
         }
         .onChange(of: memoryCoordinator.latestEvent) { _, event in
             guard let event else { return }
@@ -121,9 +138,9 @@ struct PatientCameraView: View {
     }
 
     private func handleFaceBoundStateChanged() {
-        let hasStableFaceProfile = viewModel.detectionResult.hasFace && viewModel.detectionResult.faceProfileId != nil
+        let hasFace = viewModel.detectionResult.hasFace
 
-        if hasStableFaceProfile {
+        if hasFace {
             faceGateTask?.cancel()
             guard !transcriptionActive else { return }
 
@@ -131,8 +148,7 @@ struct PatientCameraView: View {
                 try? await Task.sleep(for: .milliseconds(120))
                 guard
                     !Task.isCancelled,
-                    viewModel.detectionResult.hasFace,
-                    viewModel.detectionResult.faceProfileId != nil
+                    viewModel.detectionResult.hasFace
                 else {
                     return
                 }
@@ -153,62 +169,68 @@ struct PatientCameraView: View {
     }
 
     private func handleFaceProfileChanged(to faceProfileId: String?) {
+        memoryCoordinator.updateActiveFaceProfileId(faceProfileId)
+
         guard transcriptionActive else {
             handleFaceBoundStateChanged()
             return
         }
 
-        guard faceProfileId == activeTranscriptionFaceProfileId else {
-            restartFaceBoundTranscriptionForFaceChange()
+        guard faceProfileId != activeTranscriptionFaceProfileId else {
             return
+        }
+
+        if activeTranscriptionFaceProfileId != nil {
+            memoryCoordinator.flushCurrentTranscript()
+            memoryCoordinator.endFaceBoundConversation()
+        }
+
+        activeTranscriptionFaceProfileId = faceProfileId
+        guard let faceProfileId else { return }
+
+        memoryCoordinator.updateActiveFaceProfileId(faceProfileId)
+        memoryCoordinator.beginFaceBoundConversation()
+        let existingTranscript = speechService.transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !existingTranscript.isEmpty {
+            memoryCoordinator.submitTranscript(existingTranscript)
         }
     }
 
     private func startFaceBoundTranscription() {
         guard !transcriptionActive else { return }
-        guard let faceProfileId = viewModel.detectionResult.faceProfileId else { return }
 
         stopTranscriptionTask?.cancel()
         transcriptionActive = true
-        activeTranscriptionFaceProfileId = faceProfileId
+        activeTranscriptionFaceProfileId = viewModel.detectionResult.faceProfileId
         speechService.resetTranscript()
-        memoryCoordinator.updateActiveFaceProfileId(faceProfileId)
-        memoryCoordinator.beginFaceBoundConversation()
+        if let activeTranscriptionFaceProfileId {
+            memoryCoordinator.updateActiveFaceProfileId(activeTranscriptionFaceProfileId)
+            memoryCoordinator.beginFaceBoundConversation()
+        }
         speechService.startRecording()
     }
 
     private func stopFaceBoundTranscription() {
         guard transcriptionActive else { return }
 
+        let hadActiveFaceProfile = activeTranscriptionFaceProfileId != nil
         transcriptionActive = false
         activeTranscriptionFaceProfileId = nil
         speechService.stopRecording()
-        memoryCoordinator.flushCurrentTranscript()
+        if hadActiveFaceProfile {
+            memoryCoordinator.flushCurrentTranscript()
+        }
 
         stopTranscriptionTask?.cancel()
         stopTranscriptionTask = Task { @MainActor in
             try? await Task.sleep(for: .milliseconds(800))
             guard !Task.isCancelled, !transcriptionActive else { return }
 
-            memoryCoordinator.flushCurrentTranscript()
-            memoryCoordinator.endFaceBoundConversation()
+            if hadActiveFaceProfile {
+                memoryCoordinator.flushCurrentTranscript()
+                memoryCoordinator.endFaceBoundConversation()
+            }
         }
-    }
-
-    private func restartFaceBoundTranscriptionForFaceChange() {
-        faceGateTask?.cancel()
-        stopTranscriptionTask?.cancel()
-
-        if transcriptionActive {
-            transcriptionActive = false
-            activeTranscriptionFaceProfileId = nil
-            speechService.stopRecording()
-            memoryCoordinator.flushCurrentTranscript()
-            memoryCoordinator.endFaceBoundConversation()
-            speechService.resetTranscript()
-        }
-
-        handleFaceBoundStateChanged()
     }
 
     private func showSavedBanner(for event: MemoryCoordinatorEvent) {
@@ -322,6 +344,28 @@ private struct CameraMessageView: View {
             }
         }
         .shadow(color: .black.opacity(0.24), radius: 18, y: 8)
+    }
+}
+
+private struct EnrollmentStatusPill: View {
+    let name: String
+    let progress: Int
+    let target: Int
+
+    var body: some View {
+        Text("Learning \(name) \(progress)/\(target)")
+            .font(.subheadline.weight(.semibold))
+            .foregroundStyle(.white)
+            .lineLimit(1)
+            .minimumScaleFactor(0.82)
+            .padding(.horizontal, 16)
+            .frame(height: 42)
+            .background(.black.opacity(0.58), in: Capsule())
+            .overlay {
+                Capsule()
+                    .stroke(.white.opacity(0.18), lineWidth: 1)
+            }
+            .shadow(color: .black.opacity(0.22), radius: 14, y: 6)
     }
 }
 
