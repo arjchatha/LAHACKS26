@@ -65,8 +65,8 @@ struct PatientCameraView: View {
                     Spacer()
                 }
                 .frame(width: geometry.size.width, height: geometry.size.height, alignment: .topTrailing)
-                .padding(.top, 16)
-                .padding(.trailing, 14)
+                .padding(.top, 34)
+                .padding(.trailing, 30)
                 .allowsHitTesting(false)
             }
             .frame(width: geometry.size.width, height: geometry.size.height)

@@ -9,18 +9,22 @@ import Combine
 import Foundation
 
 enum DemoPersonStatus: String, Equatable {
-    case draft
-    case approved
-    case rejected
+    case saved
+    case removed
 
     var displayName: String {
-        rawValue.capitalized
+        switch self {
+        case .saved:
+            "Saved"
+        case .removed:
+            "Removed"
+        }
     }
 }
 
 enum DemoRecognitionStatus: String, Equatable {
     case unverified
-    case approvedForRecognition
+    case availableForRecognition
 }
 
 struct DemoPersonMemory: Identifiable, Equatable {
@@ -32,15 +36,11 @@ struct DemoPersonMemory: Identifiable, Equatable {
     var transcriptEvidence: [String]
     var faceProfileId: String?
     var faceCaptureConfidence: Double?
-    var caregiverApproved: Bool
     var recognitionStatus: DemoRecognitionStatus
     var status: DemoPersonStatus
-    var needsCaregiverReview: Bool
     var createdAt: Date
     var updatedAt: Date
-    var approvedAt: Date?
-    var rejectedAt: Date?
-    var reviewedBy: String?
+    var lastEditedAt: Date?
 
     var transcript: String {
         transcriptEvidence.joined(separator: "\n\n")
@@ -103,14 +103,13 @@ enum PersonProfileDisplayResult: Equatable {
 
 @MainActor
 protocol MemoryBridge: AnyObject {
-    func storePersonDraft(
+    func storePersonMemory(
         transcript: String,
         extractedName: String?,
         extractedRelationship: String?,
         extractedHelpfulContext: String?,
         faceProfileId: String,
-        confidence: Double,
-        needsCaregiverReview: Bool
+        confidence: Double
     ) -> DemoPersonMemory?
     func storeInteractionMemory(
         memoryType: String,
@@ -122,14 +121,18 @@ protocol MemoryBridge: AnyObject {
         transcript: String,
         faceProfileId: String
     ) -> InteractionMemory?
-    func recognizeApprovedPerson(faceProfileId: String) -> String
+    func recognizeStoredPerson(faceProfileId: String) -> String
     func profileDisplay(for faceProfileId: String) -> PersonProfileDisplayResult
-    func approvePersonEnrollment(personId: String, caregiverName: String)
-    func rejectPersonEnrollment(personId: String, caregiverName: String)
+    func updatePersonMemory(
+        personId: String,
+        name: String,
+        relationship: String,
+        helpfulContext: String,
+        patientPrompt: String
+    ) -> DemoPersonMemory?
     func allPeople() -> [DemoPersonMemory]
     func recentInteractions() -> [InteractionMemory]
-    func pendingDraftPeople() -> [DemoPersonMemory]
-    func approvedPeople() -> [DemoPersonMemory]
+    func storedPeople() -> [DemoPersonMemory]
     func searchPeople(query: String) -> [DemoPersonMemory]
     func wikiPage(for personId: String) -> String?
     func memoryWikiMarkdown() -> String
@@ -144,14 +147,13 @@ final class MockMemoryBridge: ObservableObject, MemoryBridge {
     @Published private(set) var people: [DemoPersonMemory] = []
     @Published private(set) var interactions: [InteractionMemory] = []
 
-    func storePersonDraft(
+    func storePersonMemory(
         transcript: String,
         extractedName: String?,
         extractedRelationship: String?,
         extractedHelpfulContext: String?,
         faceProfileId: String,
-        confidence: Double,
-        needsCaregiverReview: Bool
+        confidence: Double
     ) -> DemoPersonMemory? {
         guard let name = extractedName?.trimmingCharacters(in: .whitespacesAndNewlines), !name.isEmpty else {
             return nil
@@ -180,20 +182,13 @@ final class MockMemoryBridge: ObservableObject, MemoryBridge {
             people[index].faceCaptureConfidence = confidence
             people[index].updatedAt = now
 
-            if people[index].status != .approved {
-                people[index].caregiverApproved = false
-                people[index].recognitionStatus = .unverified
-                people[index].status = .draft
-                people[index].needsCaregiverReview = true
-                people[index].approvedAt = nil
-                people[index].rejectedAt = nil
-                people[index].reviewedBy = nil
-            }
+            people[index].recognitionStatus = .availableForRecognition
+            people[index].status = .saved
 
             return people[index]
         }
 
-        let draft = DemoPersonMemory(
+        let memory = DemoPersonMemory(
             id: personId,
             name: name,
             relationship: relationship,
@@ -202,19 +197,15 @@ final class MockMemoryBridge: ObservableObject, MemoryBridge {
             transcriptEvidence: evidenceEntries,
             faceProfileId: faceProfileId,
             faceCaptureConfidence: confidence,
-            caregiverApproved: false,
-            recognitionStatus: .unverified,
-            status: .draft,
-            needsCaregiverReview: true,
+            recognitionStatus: .availableForRecognition,
+            status: .saved,
             createdAt: now,
             updatedAt: now,
-            approvedAt: nil,
-            rejectedAt: nil,
-            reviewedBy: nil
+            lastEditedAt: nil
         )
 
-        people.append(draft)
-        return draft
+        people.append(memory)
+        return memory
     }
 
     func storeInteractionMemory(
@@ -250,8 +241,8 @@ final class MockMemoryBridge: ObservableObject, MemoryBridge {
         return interaction
     }
 
-    func recognizeApprovedPerson(faceProfileId: String) -> String {
-        guard let person = approvedPerson(for: faceProfileId) else {
+    func recognizeStoredPerson(faceProfileId: String) -> String {
+        guard let person = storedPerson(for: faceProfileId) else {
             return DemoPerson.cautiousUnknownResponse
         }
 
@@ -263,7 +254,7 @@ final class MockMemoryBridge: ObservableObject, MemoryBridge {
     }
 
     func profileDisplay(for faceProfileId: String) -> PersonProfileDisplayResult {
-        guard let person = approvedPerson(for: faceProfileId) else {
+        guard let person = storedPerson(for: faceProfileId) else {
             return .unknown(DemoPerson.cautiousUnknownResponse)
         }
 
@@ -275,57 +266,56 @@ final class MockMemoryBridge: ObservableObject, MemoryBridge {
                 faceProfileId: faceProfileId,
                 name: person.name,
                 relationship: person.relationship == "person I met" ? "" : person.relationship,
-                memoryCue: recognizeApprovedPerson(faceProfileId: faceProfileId),
+                memoryCue: recognizeStoredPerson(faceProfileId: faceProfileId),
                 detailLines: detailLines
             )
         )
     }
 
-    func approvePersonEnrollment(personId: String, caregiverName: String) {
-        guard let index = people.firstIndex(where: { $0.id == personId }) else { return }
-        let now = Date()
-        people[index].caregiverApproved = true
-        people[index].recognitionStatus = .approvedForRecognition
-        people[index].status = .approved
-        people[index].needsCaregiverReview = false
-        people[index].updatedAt = now
-        people[index].approvedAt = now
-        people[index].rejectedAt = nil
-        people[index].reviewedBy = caregiverName
-        people[index].patientPrompt = patientPrompt(for: people[index])
-    }
+    func updatePersonMemory(
+        personId: String,
+        name: String,
+        relationship: String,
+        helpfulContext: String,
+        patientPrompt: String
+    ) -> DemoPersonMemory? {
+        guard let index = people.firstIndex(where: { $0.id == personId }) else { return nil }
+        let cleanedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanedName.isEmpty else { return nil }
 
-    func rejectPersonEnrollment(personId: String, caregiverName: String) {
-        guard let index = people.firstIndex(where: { $0.id == personId }) else { return }
+        let cleanedRelationship = clean(relationship, fallback: "Unknown")
+        let cleanedHelpfulContext = clean(helpfulContext, fallback: "Not captured yet")
+        let cleanedPrompt = patientPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
         let now = Date()
-        people[index].caregiverApproved = false
-        people[index].recognitionStatus = .unverified
-        people[index].status = .rejected
-        people[index].needsCaregiverReview = false
+
+        people[index].name = cleanedName
+        people[index].relationship = cleanedRelationship
+        people[index].helpfulContext = cleanedHelpfulContext
+        people[index].patientPrompt = cleanedPrompt.isEmpty
+            ? self.patientPrompt(name: cleanedName, relationship: cleanedRelationship, helpfulContext: cleanedHelpfulContext)
+            : cleanedPrompt
+        people[index].recognitionStatus = .availableForRecognition
+        people[index].status = .saved
         people[index].updatedAt = now
-        people[index].approvedAt = nil
-        people[index].rejectedAt = now
-        people[index].reviewedBy = caregiverName
+        people[index].lastEditedAt = now
+
+        return people[index]
     }
 
     func allPeople() -> [DemoPersonMemory] {
-        people.sorted { $0.updatedAt > $1.updatedAt }
+        people
+            .filter { $0.status == .saved }
+            .sorted { $0.updatedAt > $1.updatedAt }
     }
 
     func recentInteractions() -> [InteractionMemory] {
         interactions.sorted { $0.createdAt > $1.createdAt }
     }
 
-    func pendingDraftPeople() -> [DemoPersonMemory] {
-        people.filter { $0.status == .draft || $0.needsCaregiverReview }
-            .sorted { $0.updatedAt > $1.updatedAt }
-    }
-
-    func approvedPeople() -> [DemoPersonMemory] {
+    func storedPeople() -> [DemoPersonMemory] {
         people.filter {
-            $0.status == .approved &&
-                $0.caregiverApproved &&
-                $0.recognitionStatus == .approvedForRecognition
+            $0.status == .saved &&
+                $0.recognitionStatus == .availableForRecognition
         }
         .sorted { $0.updatedAt > $1.updatedAt }
     }
@@ -333,10 +323,11 @@ final class MockMemoryBridge: ObservableObject, MemoryBridge {
     func searchPeople(query: String) -> [DemoPersonMemory] {
         let normalizedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !normalizedQuery.isEmpty else {
-            return people.sorted { $0.updatedAt > $1.updatedAt }
+            return allPeople()
         }
 
         return people
+            .filter { $0.status == .saved }
             .filter { person in
                 [
                     person.name,
@@ -366,12 +357,11 @@ final class MockMemoryBridge: ObservableObject, MemoryBridge {
         return (personPages + interactionPages).joined(separator: "\n\n---\n\n")
     }
 
-    private func approvedPerson(for faceProfileId: String) -> DemoPersonMemory? {
+    private func storedPerson(for faceProfileId: String) -> DemoPersonMemory? {
         people.first {
             $0.faceProfileId == faceProfileId &&
-                $0.caregiverApproved &&
-                $0.recognitionStatus == .approvedForRecognition &&
-                $0.status == .approved
+                $0.recognitionStatus == .availableForRecognition &&
+                $0.status == .saved
         }
     }
 
@@ -485,30 +475,21 @@ final class MockMemoryBridge: ObservableObject, MemoryBridge {
         """
         # \(person.name)
 
-        Status: \(person.status.displayName)
-        Caregiver Approved: \(person.caregiverApproved)
-        Recognition Status: \(person.recognitionStatus.rawValue)
-        Trust Level: \(person.caregiverApproved ? "caregiverApproved" : "aiObserved")
-        Needs Caregiver Review: \(person.needsCaregiverReview)
+        Status: Saved
+        Recognition: \(person.recognitionStatus == .availableForRecognition ? "Available" : "Unavailable")
         Created: \(Self.localDateTime.string(from: person.createdAt))
         Updated: \(Self.localDateTime.string(from: person.updatedAt))
-        Reviewed By: \(person.reviewedBy ?? "Not reviewed")
-        Approved At: \(person.approvedAt.map(Self.localDateTime.string(from:)) ?? "Not approved")
-        Rejected At: \(person.rejectedAt.map(Self.localDateTime.string(from:)) ?? "Not rejected")
+        Last Edited At: \(person.lastEditedAt.map(Self.localDateTime.string(from:)) ?? "Not edited")
 
         ## Extracted Information
 
         Name: \(person.name)
         Relationship: \(person.relationship)
         Helpful Context: \(person.helpfulContext)
-        Retention Hint: \(person.needsCaregiverReview ? "Incomplete identity. Caregiver should add relationship/context." : "Reviewed")
 
         ## Evidence
 
         \(transcriptEvidenceMarkdown(for: person))
-
-        Safety note:
-        Do not identify this person until caregiver approval.
 
         Face profile ID:
         \(person.faceProfileId ?? "None")
@@ -518,7 +499,7 @@ final class MockMemoryBridge: ObservableObject, MemoryBridge {
 
         ## Patient Prompt
 
-        \(person.caregiverApproved ? person.patientPrompt : "Do not identify this person to the patient until caregiver approval.")
+        \(person.patientPrompt)
         """
     }
 

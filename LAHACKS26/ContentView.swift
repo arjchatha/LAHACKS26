@@ -30,9 +30,7 @@ struct ContentView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .ignoresSafeArea()
 
-            if activeView == .camera {
-                rootSwitchButton
-            }
+            rootSwitchButton
         }
         .ignoresSafeArea()
         .background(Color.black.ignoresSafeArea())

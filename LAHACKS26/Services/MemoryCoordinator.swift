@@ -330,7 +330,7 @@ final class MemoryCoordinator: ObservableObject {
         let policyDecision = capturePolicy.evaluate(
             modelDecision: modelDecision,
             transcript: transcript,
-            activeDraft: activeDraftPersonForCurrentFace()
+            activeMemory: activePersonMemoryForCurrentFace()
         )
         print("MindAnchor policy decision \(phase):", policyDecision)
         printSaveScore(policyDecision.finalDecision, phase: "policy-\(phase)")
@@ -343,7 +343,7 @@ final class MemoryCoordinator: ObservableObject {
             return storeIfNeeded(decision: policyDecision.finalDecision, transcript: transcript)
         case let .storePersonCandidate(candidate):
             return storeLocalPersonCandidate(candidate, transcript: transcript)
-        case let .updateActiveDraftWithContext(candidate):
+        case let .updateActiveMemoryWithContext(candidate):
             return storeLocalContextCandidate(candidate, transcript: transcript)
         }
     }
@@ -388,14 +388,13 @@ final class MemoryCoordinator: ObservableObject {
             patientSafeResponse: nil
         )
 
-        guard let memory = memoryBridge.storePersonDraft(
+        guard let memory = memoryBridge.storePersonMemory(
             transcript: transcript,
             extractedName: decision.extractedName,
             extractedRelationship: extractedRelationship,
             extractedHelpfulContext: extractedHelpfulContext,
             faceProfileId: faceProfileId,
-            confidence: faceConfidence,
-            needsCaregiverReview: true
+            confidence: faceConfidence
         ) else {
             latestEvent = nil
             return false
@@ -410,7 +409,7 @@ final class MemoryCoordinator: ObservableObject {
                 kind: .stored,
                 title: "Saved",
                 subtitle: memory.name,
-                patientSafeResponse: decision.patientSafeResponse ?? memoryBridge.recognizeApprovedPerson(faceProfileId: faceProfileId)
+                patientSafeResponse: decision.patientSafeResponse ?? memoryBridge.recognizeStoredPerson(faceProfileId: faceProfileId)
             )
         }
         return true
@@ -484,20 +483,19 @@ final class MemoryCoordinator: ObservableObject {
             patientSafeResponse: nil
         )
 
-        let hadExistingDraft = memoryBridge.allPeople().contains {
+        let hadExistingMemory = memoryBridge.allPeople().contains {
             $0.faceProfileId == faceProfileId &&
                 $0.name.caseInsensitiveCompare(candidate.name) == .orderedSame &&
-                $0.status == .draft
+                $0.status == .saved
         }
 
-        guard let memory = memoryBridge.storePersonDraft(
+        guard let memory = memoryBridge.storePersonMemory(
             transcript: transcript,
             extractedName: candidate.name,
             extractedRelationship: candidate.relationship,
             extractedHelpfulContext: candidate.helpfulContext,
             faceProfileId: faceProfileId,
-            confidence: faceConfidence,
-            needsCaregiverReview: true
+            confidence: faceConfidence
         ) else {
             latestEvent = nil
             return false
@@ -519,13 +517,13 @@ final class MemoryCoordinator: ObservableObject {
         lastStoredSignature = signature
         lastSavedEvidenceQuote = candidate.evidenceQuote
         lastLocalSaveDate = Date()
-        if hadExistingDraft {
-            print("MindAnchor draft person updated:", memory.name)
+        if hadExistingMemory {
+            print("MindAnchor person memory updated:", memory.name)
             if candidate.helpfulContext != "Not captured yet" {
-                print("MindAnchor active draft updated with context:", candidate.helpfulContext)
+                print("MindAnchor active memory updated with context:", candidate.helpfulContext)
             }
         } else {
-            print("MindAnchor draft person created:", memory.name)
+            print("MindAnchor person memory created:", memory.name)
         }
         print("MindAnchor local person memory saved:", memory.name)
         if let interaction {
@@ -538,7 +536,7 @@ final class MemoryCoordinator: ObservableObject {
                 kind: .stored,
                 title: "Saved",
                 subtitle: memory.name,
-                patientSafeResponse: memoryBridge.recognizeApprovedPerson(faceProfileId: faceProfileId)
+                patientSafeResponse: memoryBridge.recognizeStoredPerson(faceProfileId: faceProfileId)
             )
         }
         return true
@@ -551,17 +549,17 @@ final class MemoryCoordinator: ObservableObject {
 
     private func storeLocalContextCandidate(_ contextCandidate: LocalPersonContextCandidate, transcript: String) -> Bool {
         guard canStoreForActiveFace else { return false }
-        guard let activeDraft = activeDraftPersonForCurrentFace() else {
+        guard let activeMemory = activePersonMemoryForCurrentFace() else {
             return false
         }
 
         let mergedRelationship = mergedDraftField(
-            currentValue: activeDraft.relationship,
+            currentValue: activeMemory.relationship,
             incomingValue: contextCandidate.relationship,
             emptyValues: ["Unknown", "person I met", "possible acquaintance"]
         )
         let mergedHelpfulContext = mergedDraftField(
-            currentValue: activeDraft.helpfulContext,
+            currentValue: activeMemory.helpfulContext,
             incomingValue: contextCandidate.helpfulContext,
             emptyValues: ["Not captured yet", "No context captured yet", "No helpful context captured yet."]
         )
@@ -569,7 +567,7 @@ final class MemoryCoordinator: ObservableObject {
         let signature = [
             faceProfileId,
             "person-context",
-            activeDraft.name,
+            activeMemory.name,
             mergedRelationship,
             mergedHelpfulContext,
             contextCandidate.evidenceQuote
@@ -579,18 +577,17 @@ final class MemoryCoordinator: ObservableObject {
         latestEvent = MemoryCoordinatorEvent(
             kind: .saving,
             title: "Saving",
-            subtitle: activeDraft.name,
+            subtitle: activeMemory.name,
             patientSafeResponse: nil
         )
 
-        guard let memory = memoryBridge.storePersonDraft(
+        guard let memory = memoryBridge.storePersonMemory(
             transcript: transcript,
-            extractedName: activeDraft.name,
+            extractedName: activeMemory.name,
             extractedRelationship: mergedRelationship,
             extractedHelpfulContext: mergedHelpfulContext,
             faceProfileId: faceProfileId,
-            confidence: faceConfidence,
-            needsCaregiverReview: true
+            confidence: faceConfidence
         ) else {
             latestEvent = nil
             return false
@@ -599,7 +596,7 @@ final class MemoryCoordinator: ObservableObject {
         lastStoredSignature = signature
         lastSavedEvidenceQuote = contextCandidate.evidenceQuote
         lastLocalSaveDate = Date()
-        print("MindAnchor active draft updated with context:", contextCandidate.displayContext)
+        print("MindAnchor active memory updated with context:", contextCandidate.displayContext)
         print("MindAnchor local person memory saved:", memory.name)
 
         Task { @MainActor in
@@ -608,17 +605,16 @@ final class MemoryCoordinator: ObservableObject {
                 kind: .stored,
                 title: "Saved",
                 subtitle: memory.name,
-                patientSafeResponse: memoryBridge.recognizeApprovedPerson(faceProfileId: faceProfileId)
+                patientSafeResponse: memoryBridge.recognizeStoredPerson(faceProfileId: faceProfileId)
             )
         }
         return true
     }
 
-    private func activeDraftPersonForCurrentFace() -> DemoPersonMemory? {
+    private func activePersonMemoryForCurrentFace() -> DemoPersonMemory? {
         memoryBridge.allPeople().first {
             $0.faceProfileId == faceProfileId &&
-                $0.status == .draft &&
-                !$0.caregiverApproved
+                $0.status == .saved
         }
     }
 
@@ -980,7 +976,7 @@ private struct MemoryCapturePolicyDecision: CustomStringConvertible {
         case ignore
         case acceptModel
         case storePersonCandidate(LocalPersonProfileCandidate)
-        case updateActiveDraftWithContext(LocalPersonContextCandidate)
+        case updateActiveMemoryWithContext(LocalPersonContextCandidate)
     }
 
     var action: Action
@@ -996,8 +992,8 @@ private struct MemoryCapturePolicyDecision: CustomStringConvertible {
             actionName = "acceptModel"
         case let .storePersonCandidate(candidate):
             actionName = "storePersonCandidate(\(candidate.name))"
-        case let .updateActiveDraftWithContext(candidate):
-            actionName = "updateActiveDraftWithContext(\(candidate.displayContext))"
+        case let .updateActiveMemoryWithContext(candidate):
+            actionName = "updateActiveMemoryWithContext(\(candidate.displayContext))"
         }
 
         return "action=\(actionName), reason=\(reason), finalDecision=[\(finalDecision)]"
@@ -1010,7 +1006,7 @@ private struct MemoryCapturePolicy {
     func evaluate(
         modelDecision: TranscriptAnalysisDecision,
         transcript: String,
-        activeDraft: DemoPersonMemory?
+        activeMemory: DemoPersonMemory?
     ) -> MemoryCapturePolicyDecision {
         if let personCandidate = extractor.extractPersonProfile(from: transcript) {
             return MemoryCapturePolicyDecision(
@@ -1022,11 +1018,11 @@ private struct MemoryCapturePolicy {
             )
         }
 
-        if activeDraft != nil, let contextCandidate = extractor.extractPersonContext(from: transcript) {
+        if activeMemory != nil, let contextCandidate = extractor.extractPersonContext(from: transcript) {
             return MemoryCapturePolicyDecision(
-                action: .updateActiveDraftWithContext(contextCandidate),
-                finalDecision: decision(for: contextCandidate, activeDraft: activeDraft),
-                reason: "policy found context for active draft"
+                action: .updateActiveMemoryWithContext(contextCandidate),
+                finalDecision: decision(for: contextCandidate, activeMemory: activeMemory),
+                reason: "policy found context for active memory"
             )
         }
 
@@ -1070,22 +1066,21 @@ private struct MemoryCapturePolicy {
             evidenceQuote: candidate.evidenceQuote,
             emotionalContext: nil,
             followUpContext: nil,
-            retentionHint: candidate.hasDurableContext ? "recent" : "Incomplete identity. Caregiver should add relationship/context.",
-            needsCaregiverReview: true,
+            retentionHint: candidate.hasDurableContext ? "recent" : "identity",
             patientSafeResponse: nil
         )
     }
 
     private func decision(
         for candidate: LocalPersonContextCandidate,
-        activeDraft: DemoPersonMemory?
+        activeMemory: DemoPersonMemory?
     ) -> TranscriptAnalysisDecision {
         TranscriptAnalysisDecision(
             shouldStore: true,
             memoryType: .person,
             importance: .medium,
             storageConfidence: 0.72,
-            extractedName: activeDraft?.name,
+            extractedName: activeMemory?.name,
             extractedRelationship: candidate.relationship,
             extractedHelpfulContext: candidate.helpfulContext,
             interactionSummary: nil,
@@ -1093,7 +1088,6 @@ private struct MemoryCapturePolicy {
             emotionalContext: nil,
             followUpContext: nil,
             retentionHint: "recent",
-            needsCaregiverReview: true,
             patientSafeResponse: nil
         )
     }

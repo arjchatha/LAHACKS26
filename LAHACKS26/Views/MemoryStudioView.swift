@@ -11,24 +11,15 @@ struct MemoryStudioView: View {
     @ObservedObject var memoryBridge: MockMemoryBridge
     var onClose: (() -> Void)?
     @Environment(\.dismiss) private var dismiss
-    @State private var filter: MemoryStudioFilter = .drafts
     @State private var searchText = ""
     @State private var selectedPersonId: String?
     @State private var isWikiExpanded = false
+    @State private var editingPerson: DemoPersonMemory?
 
     private var visiblePeople: [DemoPersonMemory] {
-        let base = searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             ? memoryBridge.allPeople()
             : memoryBridge.searchPeople(query: searchText)
-
-        switch filter {
-        case .drafts:
-            return base.filter { $0.status == .draft || $0.needsCaregiverReview }
-        case .approved:
-            return base.filter { $0.status == .approved }
-        case .all:
-            return base
-        }
     }
 
     private var selectedPerson: DemoPersonMemory? {
@@ -63,28 +54,29 @@ struct MemoryStudioView: View {
 
                         recentInteractions
                     }
-                    .padding(.horizontal, 20)
-                    .padding(.top, 16)
-                    .padding(.bottom, 22)
+                    .padding(.horizontal, 18)
+                    .padding(.top, 18)
+                    .padding(.bottom, 118)
                 }
             }
             .navigationBarTitleDisplayMode(.inline)
             .toolbar(.hidden, for: .navigationBar)
-            .safeAreaInset(edge: .bottom) {
-                bottomCameraBar
-            }
         }
         .preferredColorScheme(.dark)
+        .sheet(item: $editingPerson) { person in
+            MemoryEditSheet(memoryBridge: memoryBridge, person: person)
+                .preferredColorScheme(.dark)
+        }
     }
 
     private var header: some View {
         HStack(alignment: .center, spacing: 14) {
             VStack(alignment: .leading, spacing: 4) {
-                Text("Memory Studio")
+                Text("Memories")
                     .font(.title.weight(.bold))
                     .foregroundStyle(.white)
 
-                Text("Caregiver review for conversation memories")
+                Text("Stored conversation memories")
                     .font(.subheadline.weight(.medium))
                     .foregroundStyle(.white.opacity(0.68))
             }
@@ -101,8 +93,8 @@ struct MemoryStudioView: View {
                 Image(systemName: "xmark")
                     .font(.caption.weight(.bold))
                     .foregroundStyle(.white)
-                    .frame(width: 34, height: 34)
-                    .memoryGlass(in: Circle(), tint: .white.opacity(0.08))
+                    .frame(width: 38, height: 38)
+                    .memoryGlass(in: Circle(), tint: .white.opacity(0.07))
             }
             .buttonStyle(.plain)
             .accessibilityLabel("Close Memory Studio")
@@ -135,33 +127,27 @@ struct MemoryStudioView: View {
                 }
             }
             .padding(.horizontal, 14)
-            .padding(.vertical, 10)
-            .memoryGlass(in: RoundedRectangle(cornerRadius: 16, style: .continuous), tint: .white.opacity(0.06))
+            .padding(.vertical, 13)
+            .memoryGlass(in: RoundedRectangle(cornerRadius: 26, style: .continuous), tint: .white.opacity(0.07))
 
-            Picker("Memory filter", selection: $filter) {
-                ForEach(MemoryStudioFilter.allCases) { filter in
-                    Text(filter.title).tag(filter)
-                }
-            }
-            .pickerStyle(.segmented)
         }
     }
 
     private var overview: some View {
         HStack(spacing: 0) {
-            MetricPill(title: "Review", value: "\(memoryBridge.pendingDraftPeople().count)", symbol: "person.badge.clock")
+            MetricPill(title: "People", value: "\(memoryBridge.allPeople().count)", symbol: "person.2")
             Divider()
                 .overlay(.white.opacity(0.14))
                 .padding(.vertical, 10)
-            MetricPill(title: "Approved", value: "\(memoryBridge.approvedPeople().count)", symbol: "checkmark.seal")
+            MetricPill(title: "Stored", value: "\(memoryBridge.storedPeople().count)", symbol: "checkmark.seal")
             Divider()
                 .overlay(.white.opacity(0.14))
                 .padding(.vertical, 10)
             MetricPill(title: "Evidence", value: "\(memoryBridge.recentInteractions().count)", symbol: "quote.bubble")
         }
-        .padding(.horizontal, 4)
-        .padding(.vertical, 6)
-        .memoryGlass(in: RoundedRectangle(cornerRadius: 20, style: .continuous), tint: .white.opacity(0.05))
+        .padding(.horizontal, 6)
+        .padding(.vertical, 8)
+        .memoryGlass(in: RoundedRectangle(cornerRadius: 30, style: .continuous), tint: .white.opacity(0.065))
     }
 
     private var peopleList: some View {
@@ -194,23 +180,8 @@ struct MemoryStudioView: View {
                     person: selectedPerson,
                     wikiPage: memoryBridge.wikiPage(for: selectedPerson.id),
                     isWikiExpanded: $isWikiExpanded,
-                    onApprove: {
-                        withAnimation(.smooth(duration: 0.2)) {
-                            memoryBridge.approvePersonEnrollment(
-                                personId: selectedPerson.id,
-                                caregiverName: "Caregiver"
-                            )
-                            filter = .approved
-                        }
-                    },
-                    onReject: {
-                        withAnimation(.smooth(duration: 0.2)) {
-                            memoryBridge.rejectPersonEnrollment(
-                                personId: selectedPerson.id,
-                                caregiverName: "Caregiver"
-                            )
-                            filter = .all
-                        }
+                    onEdit: {
+                        editingPerson = selectedPerson
                     }
                 )
             }
@@ -247,7 +218,7 @@ struct MemoryStudioView: View {
                 .font(.headline.weight(.bold))
                 .foregroundStyle(.white)
 
-            Text("Conversation memories created from the patient camera will appear here for caregiver review.")
+            Text("Conversation memories created from the patient camera will appear here.")
                 .font(.subheadline.weight(.medium))
                 .foregroundStyle(.white.opacity(0.68))
                 .multilineTextAlignment(.center)
@@ -256,36 +227,7 @@ struct MemoryStudioView: View {
         .frame(maxWidth: .infinity)
         .padding(.horizontal, 22)
         .padding(.vertical, 34)
-        .memoryGlass(in: RoundedRectangle(cornerRadius: 24, style: .continuous), tint: .white.opacity(0.055))
-    }
-
-    private var bottomCameraBar: some View {
-        HStack {
-            Button {
-                if let onClose {
-                    onClose()
-                } else {
-                    dismiss()
-                }
-            } label: {
-                Label("Patient Camera", systemImage: "camera.viewfinder")
-                    .font(.callout.weight(.bold))
-                    .foregroundStyle(.white)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 12)
-                    .background(.white.opacity(0.09), in: Capsule())
-            }
-            .buttonStyle(.plain)
-        }
-        .padding(.horizontal, 20)
-        .padding(.top, 10)
-        .padding(.bottom, 8)
-        .background(.ultraThinMaterial)
-        .overlay(alignment: .top) {
-            Rectangle()
-                .fill(.white.opacity(0.12))
-                .frame(height: 1)
-        }
+        .memoryGlass(in: RoundedRectangle(cornerRadius: 30, style: .continuous), tint: .white.opacity(0.06))
     }
 
     private var listTitle: String {
@@ -293,26 +235,7 @@ struct MemoryStudioView: View {
             return "Search Results"
         }
 
-        return filter.title
-    }
-}
-
-private enum MemoryStudioFilter: String, CaseIterable, Identifiable {
-    case drafts
-    case approved
-    case all
-
-    var id: String { rawValue }
-
-    var title: String {
-        switch self {
-        case .drafts:
-            "Drafts"
-        case .approved:
-            "Approved"
-        case .all:
-            "All"
-        }
+        return "Memories"
     }
 }
 
@@ -347,9 +270,9 @@ private struct PersonMemoryCard: View {
             HStack(alignment: .top, spacing: 10) {
                 Image(systemName: person.status.iconName)
                     .font(.headline.weight(.semibold))
-                    .foregroundStyle(person.status.accent)
-                    .frame(width: 30, height: 30)
-                    .background(person.status.accent.opacity(0.16), in: Circle())
+                    .foregroundStyle(.white)
+                    .frame(width: 42, height: 42)
+                    .memoryGlass(in: Circle(), tint: person.status.accent.opacity(0.32))
 
                 VStack(alignment: .leading, spacing: 4) {
                     HStack(spacing: 8) {
@@ -374,21 +297,15 @@ private struct PersonMemoryCard: View {
                 .font(.callout.weight(.medium))
                 .foregroundStyle(.white.opacity(0.74))
                 .lineLimit(2)
-
-            if person.needsCaregiverReview {
-                Label("Needs review", systemImage: "exclamationmark.circle.fill")
-                    .font(.caption.weight(.bold))
-                    .foregroundStyle(.yellow.opacity(0.92))
-            }
         }
-        .padding(15)
+        .padding(16)
         .memoryGlass(
-            in: RoundedRectangle(cornerRadius: 22, style: .continuous),
-            tint: isSelected ? .white.opacity(0.14) : .white.opacity(0.06)
+            in: RoundedRectangle(cornerRadius: 30, style: .continuous),
+            tint: isSelected ? .white.opacity(0.14) : .white.opacity(0.055)
         )
         .overlay {
-            RoundedRectangle(cornerRadius: 22, style: .continuous)
-                .stroke(isSelected ? .white.opacity(0.34) : .clear, lineWidth: 1)
+            RoundedRectangle(cornerRadius: 30, style: .continuous)
+                .stroke(isSelected ? .white.opacity(0.34) : .white.opacity(0.06), lineWidth: 1)
         }
     }
 }
@@ -397,8 +314,7 @@ private struct PersonDetailCard: View {
     let person: DemoPersonMemory
     let wikiPage: String?
     @Binding var isWikiExpanded: Bool
-    let onApprove: () -> Void
-    let onReject: () -> Void
+    let onEdit: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
@@ -406,8 +322,8 @@ private struct PersonDetailCard: View {
                 Image(systemName: "person.text.rectangle")
                     .font(.title3.weight(.semibold))
                     .foregroundStyle(.white)
-                    .frame(width: 44, height: 44)
-                    .background(.white.opacity(0.12), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                    .frame(width: 52, height: 52)
+                    .memoryGlass(in: RoundedRectangle(cornerRadius: 18, style: .continuous), tint: .white.opacity(0.08))
 
                 VStack(alignment: .leading, spacing: 5) {
                     Text(person.name)
@@ -419,14 +335,25 @@ private struct PersonDetailCard: View {
                         .foregroundStyle(.white.opacity(0.7))
                 }
 
-                Spacer()
-                StatusPill(status: person.status)
+                Spacer(minLength: 10)
+
+                Button(action: onEdit) {
+                    Label("Edit", systemImage: "pencil")
+                        .font(.callout.weight(.bold))
+                        .foregroundStyle(.white)
+                        .labelStyle(.titleAndIcon)
+                        .lineLimit(1)
+                        .frame(minWidth: 112, minHeight: 50)
+                        .memoryGlass(in: Capsule(), tint: .white.opacity(0.09))
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Edit memory")
             }
 
             detailGrid
 
             DetailSection(title: "Patient Prompt", symbol: "speaker.wave.2") {
-                Text(person.caregiverApproved ? person.patientPrompt : "Hidden from patient until caregiver approval.")
+                Text(person.patientPrompt)
                     .font(.callout.weight(.semibold))
                     .foregroundStyle(.white.opacity(0.82))
                     .fixedSize(horizontal: false, vertical: true)
@@ -449,22 +376,6 @@ private struct PersonDetailCard: View {
                 }
             }
 
-            if person.status == .draft || person.needsCaregiverReview {
-                HStack(spacing: 10) {
-                    Button(action: onApprove) {
-                        Label("Approve", systemImage: "checkmark.seal.fill")
-                            .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(MemoryStudioActionButtonStyle(tint: .green))
-
-                    Button(action: onReject) {
-                        Label("Reject", systemImage: "xmark.seal.fill")
-                            .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(MemoryStudioActionButtonStyle(tint: .red))
-                }
-            }
-
             if let wikiPage {
                 DisclosureGroup(isExpanded: $isWikiExpanded) {
                     Text(wikiPage)
@@ -482,15 +393,143 @@ private struct PersonDetailCard: View {
             }
         }
         .padding(18)
-        .memoryGlass(in: RoundedRectangle(cornerRadius: 26, style: .continuous), tint: .white.opacity(0.07))
+        .memoryGlass(in: RoundedRectangle(cornerRadius: 32, style: .continuous), tint: .white.opacity(0.065))
     }
 
     private var detailGrid: some View {
         VStack(spacing: 10) {
             DetailRow(title: "Helpful Context", value: person.helpfulContext, symbol: "sparkles")
-            DetailRow(title: "Approval", value: person.caregiverApproved ? "Caregiver approved" : "Waiting for caregiver", symbol: "checkmark.shield")
-            DetailRow(title: "Recognition", value: person.recognitionStatus.rawValue, symbol: "faceid")
+            DetailRow(title: "Status", value: person.status.displayName, symbol: "checkmark.shield")
+            DetailRow(title: "Recognition", value: person.recognitionStatus == .availableForRecognition ? "Available" : "Unavailable", symbol: "faceid")
             DetailRow(title: "Face Profile", value: person.faceProfileId ?? "None", symbol: "camera.viewfinder")
+            if let lastEditedAt = person.lastEditedAt {
+                DetailRow(
+                    title: "Last Edit",
+                    value: DateFormatter.memoryStudioTime.string(from: lastEditedAt),
+                    symbol: "pencil.and.list.clipboard"
+                )
+            }
+        }
+    }
+}
+
+private struct MemoryEditSheet: View {
+    @ObservedObject var memoryBridge: MockMemoryBridge
+    let person: DemoPersonMemory
+    @Environment(\.dismiss) private var dismiss
+    @State private var name: String
+    @State private var relationship: String
+    @State private var helpfulContext: String
+    @State private var patientPrompt: String
+
+    init(memoryBridge: MockMemoryBridge, person: DemoPersonMemory) {
+        self.memoryBridge = memoryBridge
+        self.person = person
+        _name = State(initialValue: person.name)
+        _relationship = State(initialValue: person.relationship)
+        _helpfulContext = State(initialValue: person.helpfulContext)
+        _patientPrompt = State(initialValue: person.patientPrompt)
+    }
+
+    private var canSave: Bool {
+        !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    var body: some View {
+        NavigationStack {
+            ZStack {
+                MemoryStudioBackground()
+
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 16) {
+                        Text("Edit memory")
+                            .font(.headline.weight(.bold))
+                            .foregroundStyle(.white)
+
+                        Text("Update the stored memory shown in Patient Mode.")
+                            .font(.subheadline.weight(.medium))
+                            .foregroundStyle(.white.opacity(0.68))
+
+                        editField(title: "Name", text: $name, symbol: "person")
+                        editField(title: "Relationship", text: $relationship, symbol: "person.2")
+
+                        editEditor(title: "Helpful Context", text: $helpfulContext, symbol: "sparkles", minHeight: 92)
+                        editEditor(title: "Patient Prompt", text: $patientPrompt, symbol: "speaker.wave.2", minHeight: 116)
+
+                        DetailSection(title: "Original Evidence", symbol: "quote.bubble") {
+                            VStack(alignment: .leading, spacing: 8) {
+                                ForEach(Array(person.transcriptEvidence.enumerated()), id: \.offset) { index, evidence in
+                                    Text("\(index + 1). \(evidence)")
+                                        .font(.callout.weight(.medium))
+                                        .foregroundStyle(.white.opacity(0.78))
+                                        .fixedSize(horizontal: false, vertical: true)
+                                }
+                            }
+                        }
+                    }
+                    .padding(20)
+                    .padding(.bottom, 24)
+                }
+            }
+            .navigationTitle("Edit Memory")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") {
+                        dismiss()
+                    }
+                }
+
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Save") {
+                        save()
+                    }
+                    .disabled(!canSave)
+                }
+            }
+        }
+    }
+
+    private func save() {
+        guard canSave else { return }
+        _ = memoryBridge.updatePersonMemory(
+            personId: person.id,
+            name: name,
+            relationship: relationship,
+            helpfulContext: helpfulContext,
+            patientPrompt: patientPrompt
+        )
+        dismiss()
+    }
+
+    private func editField(title: String, text: Binding<String>, symbol: String) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Label(title, systemImage: symbol)
+                .font(.caption.weight(.bold))
+                .foregroundStyle(.white.opacity(0.62))
+
+            TextField(title, text: text)
+                .font(.callout.weight(.semibold))
+                .foregroundStyle(.white)
+                .textInputAutocapitalization(.words)
+                .padding(13)
+                .memoryGlass(in: RoundedRectangle(cornerRadius: 20, style: .continuous), tint: .white.opacity(0.07))
+        }
+    }
+
+    private func editEditor(title: String, text: Binding<String>, symbol: String, minHeight: CGFloat) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Label(title, systemImage: symbol)
+                .font(.caption.weight(.bold))
+                .foregroundStyle(.white.opacity(0.62))
+
+            TextEditor(text: text)
+                .font(.callout.weight(.semibold))
+                .foregroundStyle(.white)
+                .scrollContentBackground(.hidden)
+                .frame(minHeight: minHeight)
+                .padding(9)
+                .memoryGlass(in: RoundedRectangle(cornerRadius: 20, style: .continuous), tint: .white.opacity(0.07))
         }
     }
 }
@@ -510,7 +549,7 @@ private struct DetailSection<Content: View>: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(14)
-        .background(.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .memoryGlass(in: RoundedRectangle(cornerRadius: 22, style: .continuous), tint: .white.opacity(0.055))
     }
 }
 
@@ -540,7 +579,7 @@ private struct DetailRow: View {
             Spacer()
         }
         .padding(12)
-        .background(.white.opacity(0.05), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .memoryGlass(in: RoundedRectangle(cornerRadius: 22, style: .continuous), tint: .white.opacity(0.045))
     }
 }
 
@@ -571,7 +610,7 @@ private struct RecentInteractionCard: View {
                 .lineLimit(3)
         }
         .padding(15)
-        .memoryGlass(in: RoundedRectangle(cornerRadius: 20, style: .continuous), tint: .white.opacity(0.05))
+        .memoryGlass(in: RoundedRectangle(cornerRadius: 28, style: .continuous), tint: .white.opacity(0.055))
     }
 }
 
@@ -619,34 +658,31 @@ private struct StatusPill: View {
     }
 }
 
-private struct MemoryStudioActionButtonStyle: ButtonStyle {
-    let tint: Color
-
-    func makeBody(configuration: Configuration) -> some View {
-        configuration.label
-            .font(.callout.weight(.bold))
-            .foregroundStyle(.white)
-            .padding(.horizontal, 14)
-            .padding(.vertical, 12)
-            .background(tint.opacity(configuration.isPressed ? 0.5 : 0.72), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-            .overlay {
-                RoundedRectangle(cornerRadius: 16, style: .continuous)
-                    .stroke(.white.opacity(0.18), lineWidth: 1)
-            }
-    }
-}
-
 private struct MemoryStudioBackground: View {
     var body: some View {
-        LinearGradient(
-            colors: [
-                Color(red: 0.05, green: 0.06, blue: 0.08),
-                Color(red: 0.08, green: 0.10, blue: 0.13),
-                Color(red: 0.02, green: 0.02, blue: 0.03)
-            ],
-            startPoint: .topLeading,
-            endPoint: .bottomTrailing
-        )
+        ZStack {
+            Color.black
+
+            LinearGradient(
+                colors: [
+                    .white.opacity(0.055),
+                    .white.opacity(0.018),
+                    .clear
+                ],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+
+            RadialGradient(
+                colors: [
+                    Color(red: 0.15, green: 0.24, blue: 0.22).opacity(0.24),
+                    .clear
+                ],
+                center: .topTrailing,
+                startRadius: 40,
+                endRadius: 420
+            )
+        }
         .ignoresSafeArea()
     }
 }
@@ -658,39 +694,35 @@ private extension View {
                 self
                     .glassEffect(.regular.tint(tint), in: shape)
                     .overlay {
-                        shape.stroke(.white.opacity(0.16), lineWidth: 1)
+                        shape.stroke(.white.opacity(0.22), lineWidth: 1)
                     }
             } else {
                 self
                     .background(.ultraThinMaterial, in: shape)
                     .overlay {
-                        shape.stroke(.white.opacity(0.14), lineWidth: 1)
+                        shape.stroke(.white.opacity(0.18), lineWidth: 1)
                     }
             }
         }
-        .shadow(color: .black.opacity(0.2), radius: 18, y: 8)
+        .shadow(color: .black.opacity(0.28), radius: 18, y: 8)
     }
 }
 
 private extension DemoPersonStatus {
     var accent: Color {
         switch self {
-        case .draft:
-            .yellow
-        case .approved:
+        case .saved:
             .green
-        case .rejected:
+        case .removed:
             .red
         }
     }
 
     var iconName: String {
         switch self {
-        case .draft:
-            "person.badge.clock"
-        case .approved:
+        case .saved:
             "checkmark.seal.fill"
-        case .rejected:
+        case .removed:
             "xmark.seal.fill"
         }
     }

@@ -11,7 +11,7 @@ The active prototype is a focused SwiftUI/Xcode demo:
 - Speech transcription starts only while a face is bounded.
 - Transcript snapshots are sent to a memory coordinator.
 - An LLM decision engine decides whether the conversation contains important memory information.
-- Important person memories are stored locally as draft memories.
+- Important person memories are stored locally as saved memories.
 - Patient Mode stays quiet: no tabs, no buttons, no raw transcript, no wiki popup.
 - When a memory is being written, show only a small temporary green top-right chip such as `Saving` then `Saved`.
 
@@ -20,7 +20,7 @@ Core principle:
 - Patient Mode is calm, voice-first, and camera-first.
 - The memory wiki/storage layer is the private local source of truth.
 - Face detection means only “a face is present,” not “this person is Maya.”
-- Identity should never be presented as trusted without caregiver approval.
+- Saved person memories can be used for the demo, but never claim that a person is safe or trusted.
 
 Keep the project simple, local, and demo-ready.
 
@@ -60,7 +60,7 @@ Important Swift files:
 - debounces Apple Speech partial transcripts into stable snapshots
 - prints transcript and LLM decisions to the console during testing
 - runs live, reconciliation, and final LLM passes
-- stores memory only when the decision engine says it is important enough
+- uses the LLM decision engine plus `MemoryCapturePolicy` to decide whether memory is important enough
 - publishes `MemoryCoordinatorEvent` for `Saving` and `Saved` UI chips
 
 `MemoryBridge` owns local in-memory storage only.
@@ -85,7 +85,7 @@ Not allowed on the patient camera screen unless explicitly requested:
 - raw transcript panels
 - markdown/wiki popups
 - debug JSON
-- caregiver review controls
+- admin controls
 - long instructional text
 
 Speech transcription should only run while a face is being bounded. Keep the gate tolerant enough that brief detection flicker does not constantly start and stop transcription.
@@ -133,11 +133,12 @@ Rear camera face detection
   -> stable transcript snapshots
   -> MemoryCoordinator
   -> LLMDecisionEngine
+  -> MemoryCapturePolicy
   -> local MemoryBridge storage if important
   -> temporary Saved chip
 ```
 
-Do not use simple pattern matching as the primary decision for whether to store memory. The LLM decision engine should decide whether a transcript is important.
+Do not use simple pattern matching as the primary decision for whether to store memory. The LLM decision engine should provide semantic analysis, and `MemoryCapturePolicy` should make the final save/no-save decision so obvious identity memories are not missed.
 
 The current decision model includes:
 
@@ -165,7 +166,7 @@ For testing, console logging should include:
 
 ## Storage Rules
 
-Store person memory only when the LLM decision is strong enough.
+Store person memory only when the LLM decision or MemoryCapturePolicy finds durable memory evidence.
 
 Expected important examples:
 
@@ -180,21 +181,9 @@ Expected unimportant examples:
 - `Nice weather today.`
 - short small talk with no durable identity, relationship, routine, or object fact
 
-Draft person memories should remain local/in-memory for now.
+Saved person memories should remain local/in-memory for now.
 
-Draft identity memory should use safe defaults:
-
-- caregiver approval required
-- recognition unverified
-- not trusted as a patient-facing identity yet
-
-Unapproved recognition must return a safe response:
-
-```txt
-I see someone nearby, but I do not have a caregiver-approved identity for them yet.
-```
-
-Approved recognition can return a patient-safe identity prompt, for example:
+Recognition can return a patient-safe identity prompt for saved local memories, for example:
 
 ```txt
 This is Maya, your neighbor from next door. She helps bring in your mail.
@@ -209,19 +198,16 @@ When the coordinator is actually saving a memory:
 - after local storage succeeds, publish title `Saved`
 - hide the chip after a short delay
 
-Do not show a permanent “saved draft memory” widget. Do not show the wiki on top of the camera screen.
+Do not show a permanent “saved memory” widget. Do not show the wiki on top of the camera screen.
 
 ## Trust And Safety
 
-Never identify a person as trusted before caregiver approval.
+Never claim a person is safe or trusted.
 
 Do not say:
 
-- `This is Maya.`
 - `You can trust this person.`
 - `This person is safe.`
-
-unless the memory is caregiver-approved and approved for recognition.
 
 Do not make medical claims.
 
@@ -229,7 +215,7 @@ Do not say:
 
 - `You are having a dementia episode.`
 - `This proves memory decline.`
-- `This person is safe` before caregiver approval.
+- `This person is safe.`
 
 Patient-facing language should be:
 
@@ -247,7 +233,7 @@ Do not add unless explicitly requested:
 - authentication
 - production database
 - Express/API server
-- full caregiver UI
+- full admin UI
 - bottom-tab navigation
 - object recall
 - medication tracking
@@ -312,6 +298,6 @@ The simulator may emit CoreSimulator service warnings in sandboxed CLI builds. T
 - Keep all state local/in-memory.
 - Avoid overengineering.
 - Keep patient-facing text short.
-- Do not identify unapproved people.
+- Do not claim safety/trust from face recognition.
 - Do not add unrelated features.
 - Use `apply_patch` for manual edits.
