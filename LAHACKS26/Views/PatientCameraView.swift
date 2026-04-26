@@ -8,7 +8,11 @@
 import SwiftUI
 
 struct PatientCameraView: View {
-    @StateObject private var viewModel = PatientCameraViewModel()
+    @StateObject private var viewModel: PatientCameraViewModel
+
+    init(memoryBridge: MemoryBridge = MockMemoryBridge()) {
+        _viewModel = StateObject(wrappedValue: PatientCameraViewModel(memoryBridge: memoryBridge))
+    }
 
     var body: some View {
         ZStack {
@@ -24,6 +28,7 @@ struct PatientCameraView: View {
                     detection: viewModel.detectionResult,
                     title: viewModel.focusedPersonTitle ?? "Person nearby",
                     description: viewModel.detectedPersonDescription ?? "I see someone nearby.",
+                    detailLines: viewModel.detectedPersonDetailLines,
                     onDescriptionTap: viewModel.focusNextPerson
                 )
                     .animation(.smooth(duration: 0.16), value: viewModel.detectionResult.boundingBox)
@@ -92,6 +97,7 @@ private struct FaceBoundingBoxOverlay: View {
     let detection: FaceDetectionResult
     let title: String
     let description: String
+    let detailLines: [String]
     let onDescriptionTap: () -> Void
 
     var body: some View {
@@ -113,6 +119,7 @@ private struct FaceBoundingBoxOverlay: View {
                         faceRect: fittedRect,
                         title: title,
                         description: description,
+                        detailLines: detailLines,
                         containerSize: geometry.size,
                         onTap: onDescriptionTap
                     )
@@ -126,13 +133,17 @@ private struct PersonDescriptionCallout: View {
     let faceRect: CGRect
     let title: String
     let description: String
+    let detailLines: [String]
     let containerSize: CGSize
     let onTap: () -> Void
 
     private let calloutWidth: CGFloat = 220
-    private let calloutHeight: CGFloat = 74
     private let connectorGap: CGFloat = 18
     private let horizontalInset: CGFloat = 18
+
+    private var calloutHeight: CGFloat {
+        detailLines.isEmpty ? 74 : 112
+    }
 
     var body: some View {
         let placement = placementMetrics()
@@ -146,6 +157,7 @@ private struct PersonDescriptionCallout: View {
             PersonDescriptionBubble(
                 title: title,
                 description: description,
+                detailLines: detailLines,
                 onTap: onTap
             )
                 .frame(width: calloutWidth)
@@ -185,6 +197,7 @@ private struct PersonDescriptionCallout: View {
 private struct PersonDescriptionBubble: View {
     let title: String
     let description: String
+    let detailLines: [String]
     let onTap: () -> Void
 
     var body: some View {
@@ -198,6 +211,18 @@ private struct PersonDescriptionBubble: View {
                 .foregroundStyle(.white)
                 .lineLimit(2)
                 .fixedSize(horizontal: false, vertical: true)
+
+            if !detailLines.isEmpty {
+                VStack(alignment: .leading, spacing: 3) {
+                    ForEach(detailLines.prefix(2), id: \.self) { line in
+                        Text(line)
+                            .font(.caption2.weight(.medium))
+                            .foregroundStyle(.white.opacity(0.72))
+                            .lineLimit(1)
+                    }
+                }
+                .padding(.top, 2)
+            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, 14)

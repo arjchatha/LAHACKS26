@@ -5,25 +5,86 @@
 //  Created by Codex on 4/25/26.
 //
 
+import Combine
 import Foundation
 
 protocol MemoryBridge: AnyObject {
     func startPersonEnrollmentSession() -> String
     func attachEnrollmentFaceProfile(sessionId: String, faceProfileId: String, confidence: Double)
     func recognizeApprovedPerson(faceProfileId: String) -> String
+    func profileDisplay(for faceProfileId: String) -> PersonProfileDisplayResult
+    func mockRecognizedFaceProfileId(for detection: FaceDetectionResult) -> String?
     func approvePersonEnrollment(personId: String, caregiverName: String)
 }
 
-final class MockMemoryBridge: MemoryBridge {
+enum ProfileVideoStorageError: LocalizedError {
+    case cannotFindDocumentsDirectory
+
+    var errorDescription: String? {
+        switch self {
+        case .cannotFindDocumentsDirectory:
+            "The app could not open local profile video storage."
+        }
+    }
+}
+
+final class MockMemoryBridge: ObservableObject, MemoryBridge {
     private enum DemoPerson {
+        static let anitaPersonId = "person-anita"
+        static let anitaFaceProfileId = "face-anita-001"
+        static let rahulPersonId = "person-rahul"
+        static let rahulFaceProfileId = "face-rahul-001"
         static let mayaPersonId = "person-maya"
         static let mayaFaceProfileId = "face-maya-001"
         static let cautiousUnknownResponse = "I see someone nearby, but I do not have a caregiver-approved identity for them yet."
         static let approvedMayaResponse = "This is Maya, your neighbor from next door."
     }
 
-    private var approvedFaceProfileIds: Set<String> = []
+    private var approvedFaceProfileIds: Set<String> = [
+        DemoPerson.anitaFaceProfileId,
+        DemoPerson.rahulFaceProfileId
+    ]
     private var enrollmentFaceProfilesBySessionId: [String: String] = [:]
+    @Published private(set) var enrolledVideoProfiles: [StoredPersonVideoProfile] = []
+
+    private var approvedProfilesByFaceProfileId: [String: PersonProfileDisplay] = [
+        DemoPerson.anitaFaceProfileId: PersonProfileDisplay(
+            personId: DemoPerson.anitaPersonId,
+            faceProfileId: DemoPerson.anitaFaceProfileId,
+            name: "Anita",
+            relationship: "daughter and caregiver",
+            memoryCue: "Anita is your daughter. She helps with appointments and medicine.",
+            detailLines: [
+                "Trusted caregiver",
+                "She picks you up for appointments"
+            ],
+            caregiverApproved: true
+        ),
+        DemoPerson.rahulFaceProfileId: PersonProfileDisplay(
+            personId: DemoPerson.rahulPersonId,
+            faceProfileId: DemoPerson.rahulFaceProfileId,
+            name: "Rahul",
+            relationship: "grandson",
+            memoryCue: "Rahul is your grandson. He likes visiting after school.",
+            detailLines: [
+                "Family",
+                "Anita's son"
+            ],
+            caregiverApproved: true
+        ),
+        DemoPerson.mayaFaceProfileId: PersonProfileDisplay(
+            personId: DemoPerson.mayaPersonId,
+            faceProfileId: DemoPerson.mayaFaceProfileId,
+            name: "Maya",
+            relationship: "neighbor",
+            memoryCue: "Maya is your neighbor from next door.",
+            detailLines: [
+                "Caregiver approved after enrollment",
+                "Often says hello outside"
+            ],
+            caregiverApproved: true
+        )
+    ]
 
     func startPersonEnrollmentSession() -> String {
         "enrollment-\(UUID().uuidString.prefix(8))"
@@ -45,8 +106,102 @@ final class MockMemoryBridge: MemoryBridge {
         return DemoPerson.cautiousUnknownResponse
     }
 
+    func profileDisplay(for faceProfileId: String) -> PersonProfileDisplayResult {
+        guard
+            approvedFaceProfileIds.contains(faceProfileId),
+            let profile = approvedProfilesByFaceProfileId[faceProfileId],
+            profile.caregiverApproved
+        else {
+            return .unknown(DemoPerson.cautiousUnknownResponse)
+        }
+
+        return .approved(profile)
+    }
+
+    func mockRecognizedFaceProfileId(for detection: FaceDetectionResult) -> String? {
+        guard detection.hasFace, detection.confidence >= 0.28 else { return nil }
+
+        if let faceProfileId = detection.faceProfileId, approvedFaceProfileIds.contains(faceProfileId) {
+            return faceProfileId
+        }
+
+        return enrolledVideoProfiles.last?.profile.faceProfileId
+    }
+
+    @discardableResult
+    func enrollPersonFromVideo(
+        name: String,
+        relationship: String,
+        memoryCue: String,
+        detailLines: [String],
+        sourceVideoURL: URL
+    ) throws -> PersonProfileDisplay {
+        let cleanName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanRelationship = relationship.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanMemoryCue = memoryCue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanDetailLines = detailLines
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        let personId = "person-video-\(UUID().uuidString.prefix(8))"
+        let faceProfileId = "face-video-\(UUID().uuidString.prefix(8))"
+        let storedVideoURL = try storeProfileVideo(sourceURL: sourceVideoURL, personId: personId)
+        let profile = PersonProfileDisplay(
+            personId: personId,
+            faceProfileId: faceProfileId,
+            name: cleanName,
+            relationship: cleanRelationship,
+            memoryCue: cleanMemoryCue,
+            detailLines: cleanDetailLines.isEmpty ? ["Video profile", "Caregiver approved"] : cleanDetailLines,
+            caregiverApproved: true
+        )
+
+        approvedFaceProfileIds.insert(faceProfileId)
+        approvedProfilesByFaceProfileId[faceProfileId] = profile
+        enrolledVideoProfiles.append(
+            StoredPersonVideoProfile(
+                profile: profile,
+                videoURL: storedVideoURL,
+                createdAt: Date()
+            )
+        )
+
+        return profile
+    }
+
+    func deleteVideoProfile(personId: String) {
+        guard let index = enrolledVideoProfiles.firstIndex(where: { $0.profile.personId == personId }) else {
+            return
+        }
+
+        let storedProfile = enrolledVideoProfiles.remove(at: index)
+        approvedFaceProfileIds.remove(storedProfile.profile.faceProfileId)
+        approvedProfilesByFaceProfileId.removeValue(forKey: storedProfile.profile.faceProfileId)
+
+        if FileManager.default.fileExists(atPath: storedProfile.videoURL.path) {
+            try? FileManager.default.removeItem(at: storedProfile.videoURL)
+        }
+    }
+
     func approvePersonEnrollment(personId: String, caregiverName: String) {
         guard personId == DemoPerson.mayaPersonId else { return }
         approvedFaceProfileIds.insert(DemoPerson.mayaFaceProfileId)
+    }
+
+    private func storeProfileVideo(sourceURL: URL, personId: String) throws -> URL {
+        guard let documentsDirectory = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else {
+            throw ProfileVideoStorageError.cannotFindDocumentsDirectory
+        }
+
+        let directoryURL = documentsDirectory.appendingPathComponent("ProfileVideos", isDirectory: true)
+        try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+
+        let destinationURL = directoryURL.appendingPathComponent("\(personId).mov")
+        if FileManager.default.fileExists(atPath: destinationURL.path) {
+            try FileManager.default.removeItem(at: destinationURL)
+        }
+        try FileManager.default.copyItem(at: sourceURL, to: destinationURL)
+
+        return destinationURL
     }
 }

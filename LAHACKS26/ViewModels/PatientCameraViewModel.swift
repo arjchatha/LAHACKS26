@@ -22,12 +22,14 @@ final class PatientCameraViewModel: ObservableObject {
 
     @Published private(set) var detectionResult: FaceDetectionResult = .none
     @Published private(set) var detectedPersonDescription: String?
+    @Published private(set) var detectedPersonDetailLines: [String] = []
     @Published private(set) var focusedPersonTitle: String?
     @Published private(set) var cameraMessage: String?
 
     let cameraManager = CameraManager()
 
     private let faceDetectionService = AppleVisionFaceDetectionService()
+    private let memoryBridge: MemoryBridge
     private var isProcessingFrame = false
     private var lastFrameProcessDate = Date.distantPast
     private var faceMissStreak = 0
@@ -39,7 +41,12 @@ final class PatientCameraViewModel: ObservableObject {
     private var smoothedBoundingBox: CGRect?
     private let unknownPersonDescription = "I see someone nearby. Tap here to switch focus."
 
-    init() {
+    convenience init() {
+        self.init(memoryBridge: MockMemoryBridge())
+    }
+
+    init(memoryBridge: MemoryBridge) {
+        self.memoryBridge = memoryBridge
         cameraManager.onFrame = { [weak self] pixelBuffer, isUsingFrontCamera in
             self?.processFrame(pixelBuffer, isUsingFrontCamera: isUsingFrontCamera)
         }
@@ -74,7 +81,8 @@ final class PatientCameraViewModel: ObservableObject {
         let smoothedResult = FaceDetectionResult.detected(
             confidence: focusedFace.confidence,
             boundingBox: smoothedRect(toward: focusedFace.boundingBox),
-            sourceImageSize: focusedFace.sourceImageSize
+            sourceImageSize: focusedFace.sourceImageSize,
+            faceProfileId: focusedFace.faceProfileId
         )
 
         withAnimation(.smooth(duration: 0.18)) {
@@ -108,10 +116,14 @@ final class PatientCameraViewModel: ObservableObject {
 
     private func handleDetectionResults(_ results: [FaceDetectionResult]) {
         let validResults = results.filter(\.hasFace)
-        let activeDetections = resolvedStableDetections(from: validResults)
-        let focusCandidates = validResults.isEmpty ? activeDetections : validResults
+        guard !validResults.isEmpty else {
+            clearDetectionAfterMisses()
+            return
+        }
 
-        if !activeDetections.isEmpty, let focus = resolvedFocusedDetection(from: focusCandidates) {
+        let activeDetections = resolvedStableDetections(from: validResults)
+
+        if !activeDetections.isEmpty, let focus = resolvedFocusedDetection(from: validResults) {
             faceMissStreak = 0
             focusedBoundingBox = focus.detection.boundingBox
             focusedFaceIndex = resolvedStableFocusIndex(for: focus.detection, within: activeDetections)
@@ -119,7 +131,8 @@ final class PatientCameraViewModel: ObservableObject {
             let smoothedResult = FaceDetectionResult.detected(
                 confidence: focus.detection.confidence,
                 boundingBox: smoothedRect(toward: focus.detection.boundingBox),
-                sourceImageSize: focus.detection.sourceImageSize
+                sourceImageSize: focus.detection.sourceImageSize,
+                faceProfileId: focus.detection.faceProfileId
             )
 
             withAnimation(.smooth(duration: 0.16)) {
@@ -128,6 +141,10 @@ final class PatientCameraViewModel: ObservableObject {
             return
         }
 
+        clearDetectionAfterMisses()
+    }
+
+    private func clearDetectionAfterMisses() {
         faceMissStreak += 1
 
         if detectionResult.hasFace {
@@ -172,13 +189,25 @@ final class PatientCameraViewModel: ObservableObject {
         guard result.hasFace, totalPeople > 0 else {
             focusedPersonTitle = nil
             detectedPersonDescription = nil
+            detectedPersonDetailLines = []
             return
         }
 
-        focusedPersonTitle = totalPeople > 1
+        let fallbackTitle = totalPeople > 1
             ? "Person \(personIndex + 1) of \(totalPeople)"
             : "Person nearby"
-        detectedPersonDescription = unknownPersonDescription
+
+        guard let faceProfileId = memoryBridge.mockRecognizedFaceProfileId(for: result) else {
+            focusedPersonTitle = fallbackTitle
+            detectedPersonDescription = unknownPersonDescription
+            detectedPersonDetailLines = []
+            return
+        }
+
+        let displayResult = memoryBridge.profileDisplay(for: faceProfileId)
+        focusedPersonTitle = displayResult.title
+        detectedPersonDescription = displayResult.description
+        detectedPersonDetailLines = displayResult.detailLines
     }
 
     private func resolvedStableDetections(from detections: [FaceDetectionResult]) -> [FaceDetectionResult] {
