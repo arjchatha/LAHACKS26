@@ -177,6 +177,7 @@ protocol MemoryBridge: AnyObject {
         extractedName: String?,
         extractedRelationship: String?,
         extractedHelpfulContext: String?,
+        patientPrompt: String?,
         faceProfileId: String,
         confidence: Double
     ) -> DemoPersonMemory?
@@ -246,6 +247,7 @@ final class MockMemoryBridge: ObservableObject, MemoryBridge {
         extractedName: String?,
         extractedRelationship: String?,
         extractedHelpfulContext: String?,
+        patientPrompt generatedPatientPrompt: String? = nil,
         faceProfileId: String,
         confidence: Double
     ) -> DemoPersonMemory? {
@@ -261,11 +263,12 @@ final class MockMemoryBridge: ObservableObject, MemoryBridge {
             transcriptEvidence: evidenceEntries,
             name: name
         )
-        let prompt = patientPrompt(
-            name: name,
-            relationship: relationship,
-            helpfulContext: helpfulContext
-        )
+        let prompt = cleanPatientPrompt(generatedPatientPrompt, name: name)
+            ?? patientPrompt(
+                name: name,
+                relationship: relationship,
+                helpfulContext: helpfulContext
+            )
         let now = Date()
 
         if let index = people.firstIndex(where: {
@@ -280,11 +283,12 @@ final class MockMemoryBridge: ObservableObject, MemoryBridge {
                 transcriptEvidence: evidenceEntries,
                 name: lockedName
             )
-            let lockedPrompt = patientPrompt(
-                name: lockedName,
-                relationship: lockedRelationship,
-                helpfulContext: lockedHelpfulContext
-            )
+            let lockedPrompt = cleanPatientPrompt(generatedPatientPrompt, name: lockedName)
+                ?? patientPrompt(
+                    name: lockedName,
+                    relationship: lockedRelationship,
+                    helpfulContext: lockedHelpfulContext
+                )
 
             people[index].name = lockedName
             people[index].relationship = lockedRelationship
@@ -1145,6 +1149,36 @@ final class MockMemoryBridge: ObservableObject, MemoryBridge {
     private func cleanOptional(_ value: String?) -> String? {
         let cleaned = value?.trimmingCharacters(in: .whitespacesAndNewlines)
         return cleaned?.isEmpty == false ? cleaned : nil
+    }
+
+    private func cleanPatientPrompt(_ value: String?, name: String) -> String? {
+        guard var cleaned = cleanOptional(value) else { return nil }
+        cleaned = cleaned
+            .components(separatedBy: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+
+        guard cleaned.count <= 220 else { return nil }
+        guard cleaned.localizedCaseInsensitiveContains(name) else { return nil }
+
+        let lowercased = cleaned.lowercased()
+        let blockedFragments = [
+            "patient prompt",
+            "helpful context",
+            "extracted",
+            "unknown face",
+            "not captured",
+            "no context",
+            "speech recognition",
+            "transcript"
+        ]
+        guard !blockedFragments.contains(where: { lowercased.contains($0) }) else { return nil }
+
+        if let last = cleaned.last, !".!?".contains(last) {
+            cleaned.append(".")
+        }
+
+        return cleaned
     }
 
     private func appendTranscriptEvidence(_ transcript: String, to index: Int) {

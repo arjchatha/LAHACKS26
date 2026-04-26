@@ -218,7 +218,6 @@ struct PatientCameraView: View {
 
         let hadActiveFaceProfile = activeTranscriptionFaceProfileId != nil
         transcriptionActive = false
-        activeTranscriptionFaceProfileId = nil
         speechService.stopRecording()
         if hadActiveFaceProfile {
             memoryCoordinator.flushCurrentTranscript()
@@ -226,13 +225,14 @@ struct PatientCameraView: View {
 
         stopTranscriptionTask?.cancel()
         stopTranscriptionTask = Task { @MainActor in
-            try? await Task.sleep(for: .milliseconds(800))
+            try? await Task.sleep(for: .milliseconds(1800))
             guard !Task.isCancelled, !transcriptionActive else { return }
 
             if hadActiveFaceProfile {
                 memoryCoordinator.flushCurrentTranscript()
                 memoryCoordinator.endFaceBoundConversation()
             }
+            activeTranscriptionFaceProfileId = nil
         }
     }
 
